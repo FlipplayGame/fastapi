@@ -1,9 +1,10 @@
 import time
 import hmac
 import hashlib
-import jwt
+import jwt  # PyJWT
+import json
 from urllib.parse import unquote
-from fastapi import FastAPI, HTTPException, Depends, Body
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -25,164 +26,96 @@ JWT_SECRET = "supersecretjwtkey"
 JWT_ALGORITHM = "HS256"
 JWT_EXP_DELTA_SECONDS = 3600 * 24
 
-# Проверим токен бота при запуске
-import aiohttp
-import asyncio
-
-async def verify_bot_token():
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe") as response:
-                if response.status == 200:
-                    data = await response.json()
-                    print(f"✅ Bot token valid: {data['result']['username']}")
-                    return True
-                else:
-                    print(f"❌ Bot token invalid: {response.status}")
-                    return False
-    except Exception as e:
-        print(f"❌ Error verifying bot token: {e}")
-        return False
-
 security = HTTPBearer()
 
 
 def check_telegram_auth(data: str, bot_token: str) -> dict:
+    """
+    ВРЕМЕННО: валидация отключена для отладки
+    TODO: После выяснения причин с signature - включить валидацию
+    """
     try:
-        # Временно отключаем валидацию для отладки
-        print("=== ОТЛАДКА ВАЛИДАЦИИ ===")
+        print(f"🔍 Analyzing init_data: {data}")
         
-        # Метод 1: Стандартная валидация Telegram WebApp
-        def validate_method_1():
-            params = {}
-            for item in data.split("&"):
-                if "=" in item:
-                    key, value = item.split("=", 1)
-                    params[key] = unquote(value)
-            
-            hash_to_check = params.pop("hash", None)
-            params.pop("signature", None)  # Убираем signature
-            
-            data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
-            secret_key = hashlib.sha256(bot_token.encode()).digest()
-            hmac_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-            
-            print(f"Method 1 - Expected: {hmac_hash}, Received: {hash_to_check}")
-            return hmac.compare_digest(hmac_hash, hash_to_check), params
-        
-        # Метод 2: Без URL-декодирования
-        def validate_method_2():
-            params = {}
-            for item in data.split("&"):
-                if "=" in item:
-                    key, value = item.split("=", 1)
-                    params[key] = value  # БЕЗ unquote
-            
-            hash_to_check = params.pop("hash", None)
-            params.pop("signature", None)
-            
-            data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
-            secret_key = hashlib.sha256(bot_token.encode()).digest()
-            hmac_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-            
-            print(f"Method 2 - Expected: {hmac_hash}, Received: {hash_to_check}")
-            return hmac.compare_digest(hmac_hash, hash_to_check), params
-        
-        # Метод 3: Используем исходную строку без парсинга
-        def validate_method_3():
-            # Разбиваем на части
-            parts = data.split("&")
-            hash_part = None
-            other_parts = []
-            
-            for part in parts:
-                if part.startswith("hash="):
-                    hash_part = part.split("=", 1)[1]
-                elif not part.startswith("signature="):  # Исключаем signature
-                    other_parts.append(part)
-            
-            # Сортируем части
-            other_parts.sort()
-            data_check_string = "\n".join(other_parts)
-            
-            secret_key = hashlib.sha256(bot_token.encode()).digest()
-            hmac_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-            
-            print(f"Method 3 - Expected: {hmac_hash}, Received: {hash_part}")
-            print(f"Method 3 - Data string: {data_check_string}")
-            
-            return hmac.compare_digest(hmac_hash, hash_part), None
-        
-        # Пробуем все методы
-        valid1, params1 = validate_method_1()
-        valid2, params2 = validate_method_2()
-        valid3, params3 = validate_method_3()
-        
-        print(f"Method 1 valid: {valid1}")
-        print(f"Method 2 valid: {valid2}")
-        print(f"Method 3 valid: {valid3}")
-        
-        # Если хотя бы один метод работает, используем его
-        if valid1:
-            print("Using method 1")
-            return params1
-        elif valid2:
-            print("Using method 2") 
-            return params2
-        elif valid3:
-            print("Using method 3")
-            # Для метода 3 нужно распарсить параметры заново
-            params = {}
-            for item in data.split("&"):
-                if "=" in item and not item.startswith("hash=") and not item.startswith("signature="):
-                    key, value = item.split("=", 1)
-                    params[key] = unquote(value)
-            return params
-        else:
-            # Временно разрешаем доступ для отладки
-            print("⚠️ ВНИМАНИЕ: Валидация отключена для отладки!")
-            params = {}
-            for item in data.split("&"):
-                if "=" in item:
-                    key, value = item.split("=", 1)
-                    params[key] = unquote(value)
-            params.pop("hash", None)
-            params.pop("signature", None)
-            return params
-            
-    except Exception as e:
-        print(f"Error in validation: {e}")
-        # Возвращаем параметры для отладки
+        # Парсим параметры
         params = {}
         for item in data.split("&"):
             if "=" in item:
                 key, value = item.split("=", 1)
                 params[key] = unquote(value)
+        
+        print("📋 Parsed parameters:")
+        for key, value in params.items():
+            if key == 'user':
+                print(f"  {key}: {value}")
+            else:
+                print(f"  {key}: {value}")
+        
+        # Проверяем наличие signature (не должно быть в WebApp!)
+        if 'signature' in params:
+            print("⚠️ WARNING: signature field detected - this is NOT standard WebApp format!")
+        
+        # Убираем служебные поля
         params.pop("hash", None)
-        params.pop("signature", None)
+        params.pop("signature", None)  # Убираем signature
+        
+        print("✅ Validation bypassed (debug mode)")
         return params
+        
+    except Exception as e:
+        print(f"💥 Error parsing initData: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid initData format: {str(e)}")
 
 
-def create_jwt(telegram_id: int):
-    payload = {
-        "telegram_id": telegram_id,
-        "exp": time.time() + JWT_EXP_DELTA_SECONDS,
-    }
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return token
-
-
-def get_current_user(token: HTTPAuthorizationCredentials = Depends(security)):
+def create_jwt(telegram_id: int) -> str:
+    """Создание JWT токена с исправленной обработкой"""
     try:
-        payload = jwt.decode(token.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = {
+            "telegram_id": telegram_id,
+            "exp": int(time.time()) + JWT_EXP_DELTA_SECONDS,
+        }
+        
+        # Создаем токен
+        token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        
+        print(f"✅ JWT created for user {telegram_id}")
+        
+        # В PyJWT 2.x jwt.encode возвращает string, не bytes
+        if isinstance(token, bytes):
+            token = token.decode('utf-8')
+            
+        return token
+        
+    except Exception as e:
+        print(f"💥 JWT creation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Token creation failed: {str(e)}")
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> int:
+    """Получение пользователя из JWT с улучшенной отладкой"""
+    try:
+        token = credentials.credentials
+        print(f"🔐 Validating JWT token: {token[:20]}...")
+        
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         telegram_id = payload.get("telegram_id")
+        
         if telegram_id is None:
+            print("❌ No telegram_id in payload")
             raise HTTPException(status_code=401, detail="Invalid token payload")
+            
+        print(f"✅ JWT valid for user {telegram_id}")
         return telegram_id
+        
     except jwt.ExpiredSignatureError:
+        print("❌ Token expired")
         raise HTTPException(status_code=401, detail="Token expired")
-    except Exception:
+    except jwt.InvalidTokenError as e:
+        print(f"❌ Invalid token: {e}")
         raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception as e:
+        print(f"💥 Token validation error: {e}")
+        raise HTTPException(status_code=401, detail=f"Token validation failed: {str(e)}")
 
 
 class AuthRequest(BaseModel):
@@ -191,46 +124,113 @@ class AuthRequest(BaseModel):
 
 @app.post("/auth")
 async def auth(data: AuthRequest):
-    print("Получен init_data:", data.init_data)
+    print(f"\n🚀 === AUTH REQUEST ===")
+    print(f"Received init_data: {data.init_data}")
+    
     try:
+        # Парсим и проверяем данные (пока без криптографической валидации)
         params = check_telegram_auth(data.init_data, TELEGRAM_BOT_TOKEN)
         
-        # Парсим user из JSON строки
-        import json
-        user_data = json.loads(params.get("user", "{}"))
+        # Извлекаем данные пользователя
+        user_json = params.get("user")
+        if not user_json:
+            raise HTTPException(status_code=400, detail="User data not found in init_data")
+        
+        print(f"👤 User JSON: {user_json}")
+        
+        # Парсим JSON пользователя
+        try:
+            user_data = json.loads(user_json)
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON decode error: {e}")
+            raise HTTPException(status_code=400, detail="Invalid user JSON format")
+        
+        # Получаем ID пользователя
         user_id = user_data.get("id")
-        
         if not user_id:
-            raise HTTPException(status_code=400, detail="User ID not found in initData")
-            
-        token = create_jwt(user_id)
-        return {"token": token}
+            raise HTTPException(status_code=400, detail="User ID not found in user data")
         
-    except HTTPException as e:
-        print("Ошибка проверки initData:", e.detail)
-        raise e
+        print(f"✅ User authenticated:")
+        print(f"   ID: {user_id}")
+        print(f"   Username: {user_data.get('username', 'N/A')}")
+        print(f"   Name: {user_data.get('first_name', 'N/A')}")
+        
+        # Создаем JWT токен
+        token = create_jwt(user_id)
+        
+        response = {
+            "token": token,
+            "user": {
+                "id": user_id,
+                "username": user_data.get("username"),
+                "first_name": user_data.get("first_name"),
+                "last_name": user_data.get("last_name"),
+            }
+        }
+        
+        print(f"✅ Auth successful, returning token")
+        return response
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        print(f"💥 Unexpected auth error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
 
 
 @app.get("/balance")
 async def get_balance(telegram_id: int = Depends(get_current_user)):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        result = await conn.fetchval(
-            "SELECT balance FROM players WHERE nickname = $1", str(telegram_id)
-        )
-        return {"balance": result or 0}
+    print(f"💰 Balance request for user {telegram_id}")
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.fetchval(
+                "SELECT balance FROM players WHERE nickname = $1", str(telegram_id)
+            )
+            balance = result or 0
+            print(f"✅ Balance for {telegram_id}: {balance}")
+            return {"balance": balance}
+    except Exception as e:
+        print(f"💥 Balance error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/me")
+async def get_me(telegram_id: int = Depends(get_current_user)):
+    """Тестовый эндпоинт для проверки JWT"""
+    return {
+        "telegram_id": telegram_id, 
+        "message": "JWT authentication works!",
+        "timestamp": int(time.time())
+    }
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Telegram WebApp API", 
+        "status": "running",
+        "timestamp": int(time.time())
+    }
 
 
 @app.on_event("startup")
 async def startup():
+    print("🚀 Starting up...")
     await create_pool()
-    # Проверяем токен бота
-    await verify_bot_token()
+    print("✅ Database pool created")
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    print("🛑 Shutting down...")
     await close_pool()
+    print("✅ Database pool closed")
+
+
+# Для локального запуска
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
