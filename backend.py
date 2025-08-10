@@ -1,7 +1,7 @@
 import time
 import hmac
 import hashlib
-import jwt
+import PyJWT as jwt
 from urllib.parse import unquote
 from fastapi import FastAPI, HTTPException, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +24,25 @@ TELEGRAM_BOT_TOKEN = "7518552373:AAEsz41grTWOKUnokKBaSBMujTxyVgn_EOk"
 JWT_SECRET = "supersecretjwtkey"
 JWT_ALGORITHM = "HS256"
 JWT_EXP_DELTA_SECONDS = 3600 * 24
+
+# Проверим токен бота при запуске
+import aiohttp
+import asyncio
+
+async def verify_bot_token():
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe") as response:
+                if response.status == 200:
+                    data = await response.json()
+                    print(f"✅ Bot token valid: {data['result']['username']}")
+                    return True
+                else:
+                    print(f"❌ Bot token invalid: {response.status}")
+                    return False
+    except Exception as e:
+        print(f"❌ Error verifying bot token: {e}")
+        return False
 
 security = HTTPBearer()
 
@@ -208,6 +227,8 @@ async def get_balance(telegram_id: int = Depends(get_current_user)):
 @app.on_event("startup")
 async def startup():
     await create_pool()
+    # Проверяем токен бота
+    await verify_bot_token()
 
 
 @app.on_event("shutdown")
