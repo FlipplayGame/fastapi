@@ -1,7 +1,7 @@
 import time
 import hmac
 import hashlib
-import PyJWT as jwt
+import jwt
 from urllib.parse import unquote
 from fastapi import FastAPI, HTTPException, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
