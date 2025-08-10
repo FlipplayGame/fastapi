@@ -151,6 +151,13 @@ async def auth(data: AuthRequest):
             raise HTTPException(status_code=400, detail="User ID not found in user data")
         
         user_id = user_data.get("id")
+
+        try:
+            user_id = int(user_id_raw)
+        except (ValueError, TypeError) as e:
+            print(f"❌ Invalid user_id format: {user_id_raw}")
+            raise HTTPException(status_code=400, detail=f"Invalid user ID format: {user_id_raw}")
+
         nickname = user_data.get('first_name', 'Anonymous')
         try:
             pool = await get_pool()
