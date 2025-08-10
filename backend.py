@@ -231,7 +231,19 @@ async def get_balance(telegram_id: int = Depends(get_current_user)):
         print(f"💥 Balance error: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
+@app.get("/leaderboard")
+async def get_leaderboard():
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT nickname, balance FROM players ORDER BY balance DESC LIMIT 5"
+            )
+            leaderboard = [{"nickname": row["nickname"], "balance": row["balance"]} for row in rows]
+            return leaderboard
+    except Exception as e:
+        print(f"💥 Leaderboard error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.post("/balance/update")
 async def get_balance_update(telegram_id: int = Depends(get_current_user)):
