@@ -146,13 +146,11 @@ async def auth(data: AuthRequest):
             raise HTTPException(status_code=400, detail="Invalid user JSON format")
         
         # Получаем ID пользователя
-        user_id = user_data.get("id")
+        user_id_raw = user_data.get("id")
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID not found in user data")
         
-        user_id = user_data.get("id")
-        int_user_id = int(user_id)
-
+        user_id = int(user_id_raw)
         nickname = user_data.get('first_name', 'Anonymous')
         try:
             pool = await get_pool()
@@ -162,7 +160,7 @@ async def auth(data: AuthRequest):
                     INSERT INTO players (telegram_id, nickname) 
                     VALUES ($1, $2) 
                     ON CONFLICT (telegram_id) DO NOTHING
-                """, int_user_id, nickname)
+                """, user_id, nickname)
                 print(f"✅ User {user_id} added to database (or already exists)")
         
         except Exception as e:
@@ -195,12 +193,13 @@ async def auth(data: AuthRequest):
 
 @app.get("/balance")
 async def get_balance(telegram_id: int = Depends(get_current_user)):
-    print(f"💰 Balance request for user {telegram_id}")
+    print(f"💰 Balance request for user {telegram_id} (type: {type(telegram_id).__name__})")
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
+            # ИСПРАВЛЕНО: передаем telegram_id как int, а не str!
             result = await conn.fetchval(
-                "SELECT balance FROM players WHERE telegram_id = $1", str(telegram_id)
+                "SELECT balance FROM players WHERE telegram_id = $1", telegram_id
             )
             balance = result or 0
             print(f"✅ Balance for {telegram_id}: {balance}")
