@@ -128,7 +128,7 @@ async def auth(data: AuthRequest):
     print(f"Received init_data: {data.init_data}")
     
     try:
-        # Парсим и проверяем данные (пока без криптографической валидации)
+        # Парсим и проверяем данные
         params = check_telegram_auth(data.init_data, TELEGRAM_BOT_TOKEN)
         
         # Извлекаем данные пользователя
@@ -141,21 +141,37 @@ async def auth(data: AuthRequest):
         # Парсим JSON пользователя
         try:
             user_data = json.loads(user_json)
+            print(f"🔍 Parsed user_data: {user_data}")
         except json.JSONDecodeError as e:
             print(f"❌ JSON decode error: {e}")
             raise HTTPException(status_code=400, detail="Invalid user JSON format")
         
-        # Получаем ID пользователя
+        # Получаем и преобразуем ID пользователя
         user_id_raw = user_data.get("id")
-        if not user_id:
+        print(f"🆔 Raw user_id from JSON: {user_id_raw} (type: {type(user_id_raw)})")
+        
+        if not user_id_raw:
             raise HTTPException(status_code=400, detail="User ID not found in user data")
         
-        user_id = int(user_id_raw)
+        # Преобразуем в int
+        try:
+            user_id = int(user_id_raw)
+            print(f"✅ Converted user_id: {user_id} (type: {type(user_id)})")
+        except (ValueError, TypeError) as e:
+            print(f"❌ Cannot convert user_id to int: {user_id_raw}, error: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid user ID format: {user_id_raw}")
+        
         nickname = user_data.get('first_name', 'Anonymous')
+        
+        print(f"✅ User authenticated:")
+        print(f"   ID: {user_id} (type: {type(user_id).__name__})")
+        print(f"   Username: {user_data.get('username', 'N/A')}")
+        print(f"   Name: {nickname}")
+        
+        # Добавляем пользователя в БД
         try:
             pool = await get_pool()
             async with pool.acquire() as conn:
-                # Используем ON CONFLICT DO NOTHING для PostgreSQL
                 await conn.execute("""
                     INSERT INTO players (telegram_id, nickname) 
                     VALUES ($1, $2) 
@@ -165,9 +181,15 @@ async def auth(data: AuthRequest):
         
         except Exception as e:
             print(f"⚠️ Database insert warning: {e}")
-
-        # Создаем JWT токен
-        token = create_jwt(user_id)
+            # Продолжаем работу даже при ошибке БД
+        
+        # Создаем JWT токен с int значением
+        try:
+            token = create_jwt(user_id)
+            print(f"✅ JWT token created for user {user_id}")
+        except Exception as e:
+            print(f"❌ JWT creation error: {e}")
+            raise HTTPException(status_code=500, detail=f"Token creation failed: {str(e)}")
         
         response = {
             "token": token,
@@ -179,13 +201,14 @@ async def auth(data: AuthRequest):
             }
         }
         
-
+        print(f"✅ Auth successful, returning token")
         return response
         
     except HTTPException:
         raise
     except Exception as e:
         print(f"💥 Unexpected auth error: {e}")
+        print(f"💥 Error type: {type(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
