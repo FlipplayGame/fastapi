@@ -216,20 +216,40 @@ async def auth(data: AuthRequest):
 
 @app.get("/balance")
 async def get_balance(telegram_id: int = Depends(get_current_user)):
-    print(f"💰 Balance request for user {telegram_id} (type: {type(telegram_id).__name__})")
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # ИСПРАВЛЕНО: передаем telegram_id как int, а не str!
-            result = await conn.fetchval(
-                "SELECT balance FROM players WHERE telegram_id = $1", telegram_id
+            row = await conn.fetchrow(
+                "SELECT balance, nickname FROM players WHERE telegram_id = $1", telegram_id
             )
-            balance = result or 0
-            print(f"✅ Balance for {telegram_id}: {balance}")
-            return {"balance": balance}
+            if row is None:
+                return {"balance": 0, "nickname": None}
+            balance = row["balance"] or 0
+            nickname = row["nickname"]
+            return {"balance": balance, "nickname": nickname}
     except Exception as e:
         print(f"💥 Balance error: {e}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+
+@app.post("/balance/update")
+async def get_balance_update(telegram_id: int = Depends(get_current_user)):
+    current_game = 100  # сумма для добавления
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Обновляем баланс и возвращаем новое значение
+            new_balance = await conn.fetchval(
+                "UPDATE players SET balance = balance + $1 WHERE telegram_id = $2 RETURNING balance",
+                current_game, telegram_id
+            )
+            return {"balance": new_balance}
+    except Exception as e:
+        print(f"💥 Balance error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
 
 
 @app.get("/me")
