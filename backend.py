@@ -151,12 +151,7 @@ async def auth(data: AuthRequest):
             raise HTTPException(status_code=400, detail="User ID not found in user data")
         
         user_id = user_data.get("id")
-
-        try:
-            user_id = int(user_id_raw)
-        except (ValueError, TypeError) as e:
-            print(f"❌ Invalid user_id format: {user_id_raw}")
-            raise HTTPException(status_code=400, detail=f"Invalid user ID format: {user_id_raw}")
+        int_user_id = int(user_id)
 
         nickname = user_data.get('first_name', 'Anonymous')
         try:
@@ -167,7 +162,7 @@ async def auth(data: AuthRequest):
                     INSERT INTO players (telegram_id, nickname) 
                     VALUES ($1, $2) 
                     ON CONFLICT (telegram_id) DO NOTHING
-                """, user_id, nickname)
+                """, int_user_id, nickname)
                 print(f"✅ User {user_id} added to database (or already exists)")
         
         except Exception as e:
