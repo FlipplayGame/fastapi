@@ -150,11 +150,22 @@ async def auth(data: AuthRequest):
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID not found in user data")
         
-        print(f"✅ User authenticated:")
-        print(f"   ID: {user_id}")
-        print(f"   Username: {user_data.get('username', 'N/A')}")
-        print(f"   Name: {user_data.get('first_name', 'N/A')}")
+        user_id = user_data.get("id")
+        nickname = user_data.get('first_name', 'Anonymous')
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                # Используем ON CONFLICT DO NOTHING для PostgreSQL
+                await conn.execute("""
+                    INSERT INTO players (telegram_id, nickname) 
+                    VALUES ($1, $2) 
+                    ON CONFLICT (telegram_id) DO NOTHING
+                """, user_id, nickname)
+                print(f"✅ User {user_id} added to database (or already exists)")
         
+        except Exception as e:
+            print(f"⚠️ Database insert warning: {e}")
+
         # Создаем JWT токен
         token = create_jwt(user_id)
         
@@ -168,7 +179,7 @@ async def auth(data: AuthRequest):
             }
         }
         
-        print(f"✅ Auth successful, returning token")
+
         return response
         
     except HTTPException:
@@ -187,7 +198,7 @@ async def get_balance(telegram_id: int = Depends(get_current_user)):
         pool = await get_pool()
         async with pool.acquire() as conn:
             result = await conn.fetchval(
-                "SELECT balance FROM players WHERE nickname = $1", str(telegram_id)
+                "SELECT balance FROM players WHERE telegram_id = $1", str(telegram_id)
             )
             balance = result or 0
             print(f"✅ Balance for {telegram_id}: {balance}")
