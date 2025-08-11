@@ -1,6 +1,8 @@
 import time
 import hmac
 import hashlib
+import random
+from typing import Optional
 import jwt  # PyJWT
 import json
 from urllib.parse import unquote
@@ -19,7 +21,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+active_games = {}
 # Секреты (в проде лучше из env)
 TELEGRAM_BOT_TOKEN = "7518552373:AAEsz41grTWOKUnokKBaSBMujTxyVgn_EOk"
 JWT_SECRET = "supersecretjwtkey"
@@ -27,7 +29,11 @@ JWT_ALGORITHM = "HS256"
 JWT_EXP_DELTA_SECONDS = 3600 * 24
 
 security = HTTPBearer()
+class GuessGameRequest(BaseModel):
+    guess: int
 
+class StartGuessGameRequest(BaseModel):
+    difficulty: str = "medium"  # easy, medium, hard
 
 def check_telegram_auth(data: str, bot_token: str) -> dict:
     """
@@ -173,9 +179,9 @@ async def auth(data: AuthRequest):
             pool = await get_pool()
             async with pool.acquire() as conn:
                 await conn.execute("""
-                    INSERT INTO players (telegram_id, nickname) 
-                    VALUES ($1, $2) 
-                    ON CONFLICT (telegram_id) DO NOTHING
+                    INSERT INTO players (telegram_id, nickname, attempts) 
+                    VALUES ($1, $2, 3) 
+                    ON CONFLICT (telegram_id) DO UPDATE SET nickname = EXCLUDED.nickname
                 """, user_id, nickname)
                 print(f"✅ User {user_id} added to database (or already exists)")
         
@@ -262,7 +268,171 @@ async def get_balance_update(telegram_id: int = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 
+@app.get("/debug/user")
+async def debug_user(telegram_id: int = Depends(get_current_user)):
+    """Отладочный endpoint для проверки данных пользователя"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Проверяем структуру таблицы
+            table_info = await conn.fetch("""
+                SELECT column_name, data_type, is_nullable, column_default
+                FROM information_schema.columns 
+                WHERE table_name = 'players'
+                ORDER BY ordinal_position
+            """)
+            
+            # Получаем данные пользователя
+            user_data = await conn.fetchrow(
+                "SELECT * FROM players WHERE telegram_id = $1", telegram_id
+            )
+            
+            return {
+                "user_id": telegram_id,
+                "table_structure": [dict(row) for row in table_info],
+                "user_data": dict(user_data) if user_data else None
+            }
+    except Exception as e:
+        print(f"💥 Debug error: {e}")
+        raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
 
+@app.post("/debug/fix-attempts")
+async def fix_attempts(telegram_id: int = Depends(get_current_user)):
+    """Починить попытки пользователя (временный эндпоинт для отладки)"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Добавляем поле если его нет
+            await conn.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 3")
+            
+            # Обновляем попытки пользователя на 3
+            result = await conn.fetchrow(
+                "UPDATE players SET attempts = 3 WHERE telegram_id = $1 RETURNING *", 
+                telegram_id
+            )
+            
+            return {
+                "message": "Attempts fixed",
+                "user_data": dict(result) if result else None
+            }
+    except Exception as e:
+        print(f"💥 Fix attempts error: {e}")
+        raise HTTPException(status_code=500, detail=f"Fix error: {str(e)}")
+
+@app.get("/attempts")
+async def get_attempts(telegram_id: int = Depends(get_current_user)):
+    """Получить количество попыток пользователя"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            print(f"🎮 Getting attempts for user {telegram_id}")
+            
+            # Сначала проверим, есть ли поле attempts в таблице
+            try:
+                row = await conn.fetchrow(
+                    "SELECT attempts, balance, nickname FROM players WHERE telegram_id = $1", telegram_id
+                )
+                print(f"🔍 Database row: {dict(row) if row else 'None'}")
+            except Exception as db_error:
+                print(f"⚠️ Database schema issue: {db_error}")
+                # Возможно, поле attempts не существует, добавим его
+                try:
+                    await conn.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 3")
+                    print("✅ Added attempts column")
+                    row = await conn.fetchrow(
+                        "SELECT attempts, balance, nickname FROM players WHERE telegram_id = $1", telegram_id
+                    )
+                except Exception as alter_error:
+                    print(f"❌ Failed to add attempts column: {alter_error}")
+                    raise HTTPException(status_code=500, detail="Database schema error")
+            
+            if row is None:
+                print(f"👤 User {telegram_id} not found, creating...")
+                # Если пользователя нет, создаем с базовыми попытками
+                await conn.execute("""
+                    INSERT INTO players (telegram_id, attempts) 
+                    VALUES ($1, 3) 
+                    ON CONFLICT (telegram_id) DO NOTHING
+                """, telegram_id)
+                return {"attempts": 3}
+            
+            attempts = row["attempts"]
+            print(f"🎯 User {telegram_id} has {attempts} attempts")
+            
+            # Если attempts NULL, обновляем на 3 ТОЛЬКО ЕСЛИ это NULL
+            if attempts is None:
+                print(f"🔧 Fixing NULL attempts for user {telegram_id}")
+                await conn.execute(
+                    "UPDATE players SET attempts = 3 WHERE telegram_id = $1 AND attempts IS NULL", telegram_id
+                )
+                attempts = 3
+            
+            return {"attempts": attempts}
+    except Exception as e:
+        print(f"💥 Attempts error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.post("/attempts/use")
+async def use_attempt(telegram_id: int = Depends(get_current_user)):
+    """Использовать одну попытку"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            print(f"🎮 User {telegram_id} trying to use attempt")
+            
+            # Проверяем количество попыток
+            current_attempts = await conn.fetchval(
+                "SELECT attempts FROM players WHERE telegram_id = $1", telegram_id
+            )
+            
+            print(f"🔍 Current attempts: {current_attempts} (type: {type(current_attempts)})")
+            
+            if current_attempts is None:
+                print(f"❌ User {telegram_id} not found or attempts is NULL")
+                raise HTTPException(status_code=404, detail="User not found or attempts not initialized")
+            
+            if current_attempts <= 0:
+                print(f"❌ User {telegram_id} has no attempts left ({current_attempts})")
+                raise HTTPException(status_code=400, detail="No attempts left")
+            
+            # Уменьшаем попытки на 1
+            new_attempts = await conn.fetchval(
+                "UPDATE players SET attempts = attempts - 1 WHERE telegram_id = $1 RETURNING attempts",
+                telegram_id
+            )
+            
+            print(f"✅ User {telegram_id} used attempt. New count: {new_attempts}")
+            
+            return {"attempts": new_attempts}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"💥 Use attempt error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.post("/attempts/add")
+async def add_attempts(telegram_id: int = Depends(get_current_user)):
+    """Добавить попытки (например, за покупку или награду)"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Добавляем 1 попытку
+            new_attempts = await conn.fetchval(
+                "UPDATE players SET attempts = COALESCE(attempts, 0) + 1 WHERE telegram_id = $1 RETURNING attempts",
+                telegram_id
+            )
+            
+            if new_attempts is None:
+                raise HTTPException(status_code=404, detail="User not found")
+            
+            return {"attempts": new_attempts}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"💥 Add attempts error: {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/me")
 async def get_me(telegram_id: int = Depends(get_current_user)):
