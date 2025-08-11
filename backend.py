@@ -1,7 +1,7 @@
 import time
 import hmac
 import hashlib
-import random
+import os
 from typing import Optional
 import jwt  # PyJWT
 import json
@@ -16,32 +16,36 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В проде лучше указать домен фронта
+    allow_origins=["*"],  # В продакшене указать конкретные домены
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-active_games = {}
-# Секреты (в проде лучше из env)
-TELEGRAM_BOT_TOKEN = "7518552373:AAEsz41grTWOKUnokKBaSBMujTxyVgn_EOk"
-JWT_SECRET = "supersecretjwtkey"
+
+# Конфигурация (лучше вынести в переменные окружения)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7518552373:AAEsz41grTWOKUnokKBaSBMujTxyVgn_EOk")
+JWT_SECRET = os.getenv("JWT_SECRET", "supersecretjwtkey")
 JWT_ALGORITHM = "HS256"
 JWT_EXP_DELTA_SECONDS = 3600 * 24
 
 security = HTTPBearer()
+
+class AuthRequest(BaseModel):
+    init_data: str
+
 class GuessGameRequest(BaseModel):
     guess: int
 
 class StartGuessGameRequest(BaseModel):
-    difficulty: str = "medium"  # easy, medium, hard
+    difficulty: str = "medium"
+
 
 def check_telegram_auth(data: str, bot_token: str) -> dict:
     """
-    ВРЕМЕННО: валидация отключена для отладки
-    TODO: После выяснения причин с signature - включить валидацию
+    Валидация initData от Telegram WebApp
     """
     try:
-        print(f"🔍 Analyzing init_data: {data}")
+        print(f"🔍 Validating init_data: {data}")
         
         # Парсим параметры
         params = {}
@@ -50,43 +54,76 @@ def check_telegram_auth(data: str, bot_token: str) -> dict:
                 key, value = item.split("=", 1)
                 params[key] = unquote(value)
         
-        print("📋 Parsed parameters:")
-        for key, value in params.items():
-            if key == 'user':
-                print(f"  {key}: {value}")
-            else:
-                print(f"  {key}: {value}")
+        # Извлекаем hash для проверки
+        received_hash = params.pop("hash", None)
+        if not received_hash:
+            raise HTTPException(status_code=400, detail="Hash parameter missing")
         
-        # Проверяем наличие signature (не должно быть в WebApp!)
-        if 'signature' in params:
-            print("⚠️ WARNING: signature field detected - this is NOT standard WebApp format!")
+        # Удаляем лишние поля (signature не должно быть в WebApp)
+        params.pop("signature", None)
         
-        # Убираем служебные поля
-        params.pop("hash", None)
-        params.pop("signature", None)  # Убираем signature
+        # Создаем строку для проверки
+        data_check_arr = []
+        for key, value in sorted(params.items()):
+            data_check_arr.append(f"{key}={value}")
         
-        print("✅ Validation bypassed (debug mode)")
+        data_check_string = "\n".join(data_check_arr)
+        
+        # Создаем секретный ключ
+        secret_key = hmac.new(
+            "WebAppData".encode(), 
+            bot_token.encode(), 
+            hashlib.sha256
+        ).digest()
+        
+        # Вычисляем хеш
+        calculated_hash = hmac.new(
+            secret_key, 
+            data_check_string.encode(), 
+            hashlib.sha256
+        ).hexdigest()
+        
+        # Сравниваем хеши
+        if not hmac.compare_digest(calculated_hash, received_hash):
+            print(f"❌ Hash mismatch:")
+            print(f"   Received: {received_hash}")
+            print(f"   Calculated: {calculated_hash}")
+            print(f"   Data string: {data_check_string}")
+            raise HTTPException(status_code=400, detail="Invalid hash signature")
+        
+        # Проверяем время (опционально, данные не должны быть старше 1 часа)
+        auth_date = params.get("auth_date")
+        if auth_date:
+            try:
+                auth_timestamp = int(auth_date)
+                current_timestamp = int(time.time())
+                if current_timestamp - auth_timestamp > 3600:  # 1 час
+                    raise HTTPException(status_code=400, detail="Data is too old")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid auth_date format")
+        
+        print("✅ Telegram WebApp data validated successfully")
         return params
         
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"💥 Error parsing initData: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid initData format: {str(e)}")
+        print(f"💥 Error validating initData: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid initData: {str(e)}")
 
 
 def create_jwt(telegram_id: int) -> str:
-    """Создание JWT токена с исправленной обработкой"""
+    """Создание JWT токена"""
     try:
         payload = {
             "telegram_id": telegram_id,
             "exp": int(time.time()) + JWT_EXP_DELTA_SECONDS,
         }
         
-        # Создаем токен
         token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-        
         print(f"✅ JWT created for user {telegram_id}")
         
-        # В PyJWT 2.x jwt.encode возвращает string, не bytes
+        # PyJWT 2.x возвращает string
         if isinstance(token, bytes):
             token = token.decode('utf-8')
             
@@ -94,110 +131,81 @@ def create_jwt(telegram_id: int) -> str:
         
     except Exception as e:
         print(f"💥 JWT creation error: {e}")
-        raise HTTPException(status_code=500, detail=f"Token creation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Token creation failed")
 
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> int:
-    """Получение пользователя из JWT с улучшенной отладкой"""
+    """Получение пользователя из JWT"""
     try:
         token = credentials.credentials
-        print(f"🔐 Validating JWT token: {token[:20]}...")
-        
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         telegram_id = payload.get("telegram_id")
         
         if telegram_id is None:
-            print("❌ No telegram_id in payload")
             raise HTTPException(status_code=401, detail="Invalid token payload")
             
-        print(f"✅ JWT valid for user {telegram_id}")
         return telegram_id
         
     except jwt.ExpiredSignatureError:
-        print("❌ Token expired")
         raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError as e:
-        print(f"❌ Invalid token: {e}")
+    except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
     except Exception as e:
         print(f"💥 Token validation error: {e}")
-        raise HTTPException(status_code=401, detail=f"Token validation failed: {str(e)}")
-
-
-class AuthRequest(BaseModel):
-    init_data: str
+        raise HTTPException(status_code=401, detail="Token validation failed")
 
 
 @app.post("/auth")
 async def auth(data: AuthRequest):
     print(f"\n🚀 === AUTH REQUEST ===")
-    print(f"Received init_data: {data.init_data}")
     
     try:
-        # Парсим и проверяем данные
+        # Валидируем данные Telegram WebApp
         params = check_telegram_auth(data.init_data, TELEGRAM_BOT_TOKEN)
         
         # Извлекаем данные пользователя
         user_json = params.get("user")
         if not user_json:
-            raise HTTPException(status_code=400, detail="User data not found in init_data")
-        
-        print(f"👤 User JSON: {user_json}")
+            raise HTTPException(status_code=400, detail="User data not found")
         
         # Парсим JSON пользователя
         try:
             user_data = json.loads(user_json)
-            print(f"🔍 Parsed user_data: {user_data}")
-        except json.JSONDecodeError as e:
-            print(f"❌ JSON decode error: {e}")
+        except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid user JSON format")
         
-        # Получаем и преобразуем ID пользователя
-        user_id_raw = user_data.get("id")
-        print(f"🆔 Raw user_id from JSON: {user_id_raw} (type: {type(user_id_raw)})")
+        # Получаем ID пользователя
+        user_id = user_data.get("id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="User ID not found")
         
-        if not user_id_raw:
-            raise HTTPException(status_code=400, detail="User ID not found in user data")
-        
-        # Преобразуем в int
         try:
-            user_id = int(user_id_raw)
-            print(f"✅ Converted user_id: {user_id} (type: {type(user_id)})")
-        except (ValueError, TypeError) as e:
-            print(f"❌ Cannot convert user_id to int: {user_id_raw}, error: {e}")
-            raise HTTPException(status_code=400, detail=f"Invalid user ID format: {user_id_raw}")
+            user_id = int(user_id)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid user ID format")
         
         nickname = user_data.get('first_name', 'Anonymous')
         
-        print(f"✅ User authenticated:")
-        print(f"   ID: {user_id} (type: {type(user_id).__name__})")
-        print(f"   Username: {user_data.get('username', 'N/A')}")
-        print(f"   Name: {nickname}")
+        print(f"✅ User authenticated: ID {user_id}, Name: {nickname}")
         
-        # Добавляем пользователя в БД
+        # Добавляем/обновляем пользователя в БД
         try:
             pool = await get_pool()
             async with pool.acquire() as conn:
                 await conn.execute("""
-                    INSERT INTO players (telegram_id, nickname, attempts) 
-                    VALUES ($1, $2, 3) 
-                    ON CONFLICT (telegram_id) DO UPDATE SET nickname = EXCLUDED.nickname
+                    INSERT INTO players (telegram_id, nickname, attempts, balance) 
+                    VALUES ($1, $2, 3, 0) 
+                    ON CONFLICT (telegram_id) DO UPDATE SET 
+                        nickname = EXCLUDED.nickname
                 """, user_id, nickname)
-                print(f"✅ User {user_id} added to database (or already exists)")
-        
         except Exception as e:
-            print(f"⚠️ Database insert warning: {e}")
-            # Продолжаем работу даже при ошибке БД
+            print(f"⚠️ Database error: {e}")
+            # Продолжаем работу
         
-        # Создаем JWT токен с int значением
-        try:
-            token = create_jwt(user_id)
-            print(f"✅ JWT token created for user {user_id}")
-        except Exception as e:
-            print(f"❌ JWT creation error: {e}")
-            raise HTTPException(status_code=500, detail=f"Token creation failed: {str(e)}")
+        # Создаем JWT токен
+        token = create_jwt(user_id)
         
-        response = {
+        return {
             "token": token,
             "user": {
                 "id": user_id,
@@ -207,17 +215,11 @@ async def auth(data: AuthRequest):
             }
         }
         
-        print(f"✅ Auth successful, returning token")
-        return response
-        
     except HTTPException:
         raise
     except Exception as e:
-        print(f"💥 Unexpected auth error: {e}")
-        print(f"💥 Error type: {type(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
+        print(f"💥 Auth error: {e}")
+        raise HTTPException(status_code=500, detail="Authentication failed")
 
 
 @app.get("/balance")
@@ -230,12 +232,15 @@ async def get_balance(telegram_id: int = Depends(get_current_user)):
             )
             if row is None:
                 return {"balance": 0, "nickname": None}
-            balance = row["balance"] or 0
-            nickname = row["nickname"]
-            return {"balance": balance, "nickname": nickname}
+            
+            return {
+                "balance": row["balance"] or 0,
+                "nickname": row["nickname"]
+            }
     except Exception as e:
         print(f"💥 Balance error: {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error")
+
 
 @app.get("/leaderboard")
 async def get_leaderboard():
@@ -243,134 +248,71 @@ async def get_leaderboard():
         pool = await get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT nickname, balance FROM players ORDER BY balance DESC LIMIT 5"
+                "SELECT nickname, balance FROM players ORDER BY balance DESC LIMIT 10"
             )
-            leaderboard = [{"nickname": row["nickname"], "balance": row["balance"]} for row in rows]
-            return leaderboard
+            return [{"nickname": row["nickname"], "balance": row["balance"]} for row in rows]
     except Exception as e:
         print(f"💥 Leaderboard error: {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error")
+
 
 @app.post("/balance/update")
-async def get_balance_update(telegram_id: int = Depends(get_current_user)):
-    current_game = 100  # сумма для добавления
+async def update_balance(telegram_id: int = Depends(get_current_user)):
+    """Добавить 100 к балансу"""
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Обновляем баланс и возвращаем новое значение
             new_balance = await conn.fetchval(
-                "UPDATE players SET balance = balance + $1 WHERE telegram_id = $2 RETURNING balance",
-                current_game, telegram_id
-            )
-            return {"balance": new_balance}
-    except Exception as e:
-        print(f"💥 Balance error: {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-
-@app.get("/debug/user")
-async def debug_user(telegram_id: int = Depends(get_current_user)):
-    """Отладочный endpoint для проверки данных пользователя"""
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Проверяем структуру таблицы
-            table_info = await conn.fetch("""
-                SELECT column_name, data_type, is_nullable, column_default
-                FROM information_schema.columns 
-                WHERE table_name = 'players'
-                ORDER BY ordinal_position
-            """)
-            
-            # Получаем данные пользователя
-            user_data = await conn.fetchrow(
-                "SELECT * FROM players WHERE telegram_id = $1", telegram_id
-            )
-            
-            return {
-                "user_id": telegram_id,
-                "table_structure": [dict(row) for row in table_info],
-                "user_data": dict(user_data) if user_data else None
-            }
-    except Exception as e:
-        print(f"💥 Debug error: {e}")
-        raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
-
-@app.post("/debug/fix-attempts")
-async def fix_attempts(telegram_id: int = Depends(get_current_user)):
-    """Починить попытки пользователя (временный эндпоинт для отладки)"""
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Добавляем поле если его нет
-            await conn.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 3")
-            
-            # Обновляем попытки пользователя на 3
-            result = await conn.fetchrow(
-                "UPDATE players SET attempts = 3 WHERE telegram_id = $1 RETURNING *", 
+                "UPDATE players SET balance = COALESCE(balance, 0) + 100 WHERE telegram_id = $1 RETURNING balance",
                 telegram_id
             )
+            if new_balance is None:
+                raise HTTPException(status_code=404, detail="User not found")
             
-            return {
-                "message": "Attempts fixed",
-                "user_data": dict(result) if result else None
-            }
+            return {"balance": new_balance}
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"💥 Fix attempts error: {e}")
-        raise HTTPException(status_code=500, detail=f"Fix error: {str(e)}")
+        print(f"💥 Balance update error: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+
 
 @app.get("/attempts")
 async def get_attempts(telegram_id: int = Depends(get_current_user)):
-    """Получить количество попыток пользователя"""
+    """Получить количество попыток"""
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            print(f"🎮 Getting attempts for user {telegram_id}")
-            
-            # Сначала проверим, есть ли поле attempts в таблице
+            # Добавляем колонку attempts если её нет
             try:
-                row = await conn.fetchrow(
-                    "SELECT attempts, balance, nickname FROM players WHERE telegram_id = $1", telegram_id
-                )
-                print(f"🔍 Database row: {dict(row) if row else 'None'}")
-            except Exception as db_error:
-                print(f"⚠️ Database schema issue: {db_error}")
-                # Возможно, поле attempts не существует, добавим его
-                try:
-                    await conn.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 3")
-                    print("✅ Added attempts column")
-                    row = await conn.fetchrow(
-                        "SELECT attempts, balance, nickname FROM players WHERE telegram_id = $1", telegram_id
-                    )
-                except Exception as alter_error:
-                    print(f"❌ Failed to add attempts column: {alter_error}")
-                    raise HTTPException(status_code=500, detail="Database schema error")
+                await conn.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 3")
+            except:
+                pass  # Колонка уже существует
             
-            if row is None:
-                print(f"👤 User {telegram_id} not found, creating...")
-                # Если пользователя нет, создаем с базовыми попытками
-                await conn.execute("""
-                    INSERT INTO players (telegram_id, attempts) 
-                    VALUES ($1, 3) 
-                    ON CONFLICT (telegram_id) DO NOTHING
-                """, telegram_id)
-                return {"attempts": 3}
+            attempts = await conn.fetchval(
+                "SELECT attempts FROM players WHERE telegram_id = $1", telegram_id
+            )
             
-            attempts = row["attempts"]
-            print(f"🎯 User {telegram_id} has {attempts} attempts")
-            
-            # Если attempts NULL, обновляем на 3 ТОЛЬКО ЕСЛИ это NULL
             if attempts is None:
-                print(f"🔧 Fixing NULL attempts for user {telegram_id}")
+                # Пользователь не найден, создаем
                 await conn.execute(
-                    "UPDATE players SET attempts = 3 WHERE telegram_id = $1 AND attempts IS NULL", telegram_id
+                    "INSERT INTO players (telegram_id, attempts) VALUES ($1, 3) ON CONFLICT (telegram_id) DO NOTHING",
+                    telegram_id
+                )
+                attempts = 3
+            
+            # Если attempts NULL, устанавливаем 3
+            if attempts is None:
+                await conn.execute(
+                    "UPDATE players SET attempts = 3 WHERE telegram_id = $1 AND attempts IS NULL", 
+                    telegram_id
                 )
                 attempts = 3
             
             return {"attempts": attempts}
     except Exception as e:
-        print(f"💥 Attempts error: {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        print(f"💥 Get attempts error: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
 
 
 @app.post("/attempts/use")
@@ -379,46 +321,35 @@ async def use_attempt(telegram_id: int = Depends(get_current_user)):
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            print(f"🎮 User {telegram_id} trying to use attempt")
-            
-            # Проверяем количество попыток
             current_attempts = await conn.fetchval(
                 "SELECT attempts FROM players WHERE telegram_id = $1", telegram_id
             )
             
-            print(f"🔍 Current attempts: {current_attempts} (type: {type(current_attempts)})")
-            
             if current_attempts is None:
-                print(f"❌ User {telegram_id} not found or attempts is NULL")
-                raise HTTPException(status_code=404, detail="User not found or attempts not initialized")
+                raise HTTPException(status_code=404, detail="User not found")
             
             if current_attempts <= 0:
-                print(f"❌ User {telegram_id} has no attempts left ({current_attempts})")
                 raise HTTPException(status_code=400, detail="No attempts left")
             
-            # Уменьшаем попытки на 1
             new_attempts = await conn.fetchval(
                 "UPDATE players SET attempts = attempts - 1 WHERE telegram_id = $1 RETURNING attempts",
                 telegram_id
             )
-            
-            print(f"✅ User {telegram_id} used attempt. New count: {new_attempts}")
             
             return {"attempts": new_attempts}
     except HTTPException:
         raise
     except Exception as e:
         print(f"💥 Use attempt error: {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error")
 
 
 @app.post("/attempts/add")
 async def add_attempts(telegram_id: int = Depends(get_current_user)):
-    """Добавить попытки (например, за покупку или награду)"""
+    """Добавить одну попытку"""
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Добавляем 1 попытку
             new_attempts = await conn.fetchval(
                 "UPDATE players SET attempts = COALESCE(attempts, 0) + 1 WHERE telegram_id = $1 RETURNING attempts",
                 telegram_id
@@ -432,16 +363,7 @@ async def add_attempts(telegram_id: int = Depends(get_current_user)):
         raise
     except Exception as e:
         print(f"💥 Add attempts error: {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-@app.get("/me")
-async def get_me(telegram_id: int = Depends(get_current_user)):
-    """Тестовый эндпоинт для проверки JWT"""
-    return {
-        "telegram_id": telegram_id, 
-        "message": "JWT authentication works!",
-        "timestamp": int(time.time())
-    }
+        raise HTTPException(status_code=500, detail="Database error")
 
 
 @app.get("/")
@@ -467,7 +389,6 @@ async def shutdown():
     print("✅ Database pool closed")
 
 
-# Для локального запуска
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
