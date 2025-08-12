@@ -43,38 +43,6 @@ class WalletConnectRequest(BaseModel):
     wallet_name: str
     wallet_version: str
 
-
-
-
-async def check_payment(user_wallet: str, my_wallet: str, amount_ton: float):
-    """Проверка, что была транзакция на мой кошелек"""
-    try:
-        params = {
-            "address": my_wallet,
-            "limit": 20,
-            "api_key": TON_API_KEY
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{TON_API_URL}/getTransactions", params=params) as resp:
-                data = await resp.json()
-
-        if not data.get("ok"):
-            return False
-
-        for tx in data["result"]:
-            in_msg = tx.get("in_msg", {})
-            sender = in_msg.get("source")
-            value = int(in_msg.get("value", 0)) / 1_000_000_000
-            if sender == user_wallet and value >= amount_ton:
-                return True
-        return False
-    except Exception as e:
-        print(f"Ошибка проверки платежа: {e}")
-        return False
-
-
-
-
 def check_telegram_auth(data: str, bot_token: str) -> dict:
     """
     Валидация данных Telegram WebApp
@@ -347,39 +315,6 @@ async def connect_wallet(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to connect wallet: {str(e)}")
-
-
-@app.post("/wallet/check-payment")
-async def check_payment_route(
-    telegram_id: int = Depends(get_current_user)
-):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        wallet = await conn.fetchrow(
-            "SELECT address FROM wallets WHERE telegram_id = $1",
-            telegram_id
-        )
-        if not wallet:
-            return {"success": False, "message": "❌ Кошелёк не подключен. Подключите его, чтобы оплатить."}
-
-        user_wallet = wallet["address"]
-
-    # твой кошелек для приёма средств
-    my_wallet = "UQAojWl3iqFyhc4wxv2IH9E5yeo8IH6LBVXjbdsVVi_KUgPU"
-    amount = 0.4
-
-    paid = await check_payment(user_wallet, my_wallet, amount)
-
-    if paid:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE players SET balance = balance + 100 WHERE telegram_id = $1",
-                telegram_id
-            )
-        return {"success": True, "message": "✅ Оплата подтверждена, награда выдана!"}
-    else:
-        return {"success": False, "message": "⚠️ Оплата не найдена. Попробуйте через минуту."}
-
 
 @app.get("/wallet/info")
 async def get_wallet_info(telegram_id: int = Depends(get_current_user)):
