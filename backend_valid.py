@@ -2,8 +2,6 @@ import time
 import hmac
 import hashlib
 import json
-import asyncio
-import aiohttp
 from typing import Optional
 from urllib.parse import unquote
 import jwt  # PyJWT
@@ -29,24 +27,14 @@ JWT_SECRET = "supersecretjwtkey"
 JWT_ALGORITHM = "HS256"
 JWT_EXP_DELTA_SECONDS = 3600 * 24
 
-# TON API конфигурация
-TON_API_URL = "https://toncenter.com/api/v2"
-TON_API_KEY = None  # Можно получить на https://toncenter.com
-
 security = HTTPBearer()
 
 class AuthRequest(BaseModel):
     init_data: str
 
-class WalletConnectRequest(BaseModel):
-    address: str
-    wallet_name: str
-    wallet_version: str
-
 def check_telegram_auth(data: str, bot_token: str) -> dict:
     """
-    Валидация данных Telegram WebApp
-    Поддерживает как WebApp, так и Bot API форматы
+    Валидация данных Telegram WebApp с правильным алгоритмом
     """
     try:
         # Парсим параметры
@@ -61,42 +49,38 @@ def check_telegram_auth(data: str, bot_token: str) -> dict:
         if not received_hash:
             raise HTTPException(status_code=400, detail="Hash not found in init_data")
         
-        # Проверяем наличие signature (Bot API формат)
-        has_signature = "signature" in params
-        if has_signature:
-            params.pop("signature", None)  # Удаляем signature, он не участвует в валидации hash
+        # Удаляем signature если присутствует (не участвует в валидации hash)
+        params.pop("signature", None)
+        
+        # Обрабатываем photo_url - заменяем / на \/ как в оригинальных данных
+        user_json = params.get("user")
+        if user_json:
+            try:
+                user_data = json.loads(user_json)
+                if "photo_url" in user_data and user_data["photo_url"]:
+                    # Восстанавливаем экранированные слеши как в исходных данных
+                    user_data["photo_url"] = user_data["photo_url"].replace("/", "\\/")
+                    params["user"] = json.dumps(user_data, separators=(',', ':'))
+            except json.JSONDecodeError:
+                pass
         
         # Создаем строку для проверки (сортируем ключи)
         data_check_string = "\n".join([f"{k}={v}" for k, v in sorted(params.items())])
         
-        # Создаем секретный ключ для WebApp
+        print(f"Data check string: {repr(data_check_string)}")
+        
+        # Создаем секретный ключ для WebApp (правильный алгоритм)
         secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
         
         # Вычисляем хеш
         calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         
+        print(f"Calculated hash: {calculated_hash}")
+        print(f"Received hash:   {received_hash}")
+        
         # Проверяем хеш
         if not hmac.compare_digest(calculated_hash, received_hash):
-            # Если не совпадает, возможно это устаревший формат, попробуем другой способ
-            print(f"Hash mismatch with WebAppData method")
-            print(f"Trying alternative validation method...")
-            
-            # Альтернативный метод для некоторых случаев
-            alt_secret = hashlib.sha256(bot_token.encode()).digest()
-            alt_calculated = hmac.new(alt_secret, data_check_string.encode(), hashlib.sha256).hexdigest()
-            
-            if not hmac.compare_digest(alt_calculated, received_hash):
-                print(f"Both validation methods failed")
-                print(f"Received hash: {received_hash}")
-                print(f"Calculated (WebAppData): {calculated_hash}")
-                print(f"Calculated (alternative): {alt_calculated}")
-                print(f"Data string: {data_check_string}")
-                
-                # Для отладки - временно пропускаем валидацию если это явно Telegram данные
-                if 'user' in params and 'auth_date' in params:
-                    print("⚠️ Skipping hash validation for development (Telegram data detected)")
-                else:
-                    raise HTTPException(status_code=401, detail="Invalid hash - data may be tampered")
+            raise HTTPException(status_code=401, detail="Invalid hash - data may be tampered")
         
         # Проверяем время (данные должны быть не старше 24 часов)
         auth_date = params.get("auth_date")
@@ -105,10 +89,13 @@ def check_telegram_auth(data: str, bot_token: str) -> dict:
                 auth_timestamp = int(auth_date)
                 current_timestamp = int(time.time())
                 if current_timestamp - auth_timestamp > 86400:  # 24 часа
-                    print(f"⚠️ Auth data is old but allowing for development")
-                    # raise HTTPException(status_code=401, detail="Init data is too old")
+                    raise HTTPException(status_code=401, detail="Init data is too old")
             except ValueError:
                 raise HTTPException(status_code=400, detail="Invalid auth_date format")
+        
+        # Возвращаем params с исходным user JSON (без экранированных слешей)
+        if user_json:
+            params["user"] = user_json
         
         return params
         
@@ -154,54 +141,6 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=401, detail="Invalid token")
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Token validation failed: {str(e)}")
-
-def is_valid_ton_address(address: str) -> bool:
-    """Базовая валидация TON адреса"""
-    if not address:
-        return False
-    
-    # TON адрес может быть в двух форматах:
-    # 1. Raw address (64 hex символа)
-    # 2. User-friendly address (48 символов base64)
-    
-    # Проверяем user-friendly формат
-    if len(address) == 48 and all(c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=' for c in address):
-        return True
-    
-    # Проверяем raw формат (с префиксом или без)
-    if len(address) == 64 and all(c in '0123456789abcdefABCDEF' for c in address):
-        return True
-    
-    # Проверяем raw формат с префиксом (0:)
-    if len(address) == 66 and address.startswith('0:') and all(c in '0123456789abcdefABCDEF' for c in address[2:]):
-        return True
-    
-    return False
-
-async def get_ton_balance(address: str) -> Optional[float]:
-    """Получение баланса TON кошелька через API"""
-    try:
-        params = {
-            'address': address
-        }
-        if TON_API_KEY:
-            params['api_key'] = TON_API_KEY
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{TON_API_URL}/getAddressBalance", params=params, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get('ok'):
-                        # Баланс возвращается в nanotons, конвертируем в TON
-                        balance_nanotons = int(data.get('result', 0))
-                        balance_ton = balance_nanotons / 1_000_000_000  # 1 TON = 10^9 nanotons
-                        return round(balance_ton, 4)
-                return None
-    except Exception as e:
-        print(f"Error fetching TON balance: {e}")
-        return None
-
-# Существующие эндпойнты...
 
 @app.post("/auth")
 async def auth(data: AuthRequest):
@@ -264,144 +203,6 @@ async def auth(data: AuthRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
-
-# TON Wallet эндпойнты
-
-@app.post("/wallet/connect")
-async def connect_wallet(
-    wallet_data: WalletConnectRequest,
-    telegram_id: int = Depends(get_current_user)
-):
-    """Подключение TON кошелька к аккаунту"""
-    try:
-        # Валидация адреса
-        if not is_valid_ton_address(wallet_data.address):
-            raise HTTPException(status_code=400, detail="Invalid TON address format")
-        
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Проверяем, есть ли уже такой кошелек у другого пользователя
-            existing_wallet = await conn.fetchrow(
-                "SELECT telegram_id FROM wallets WHERE address = $1", 
-                wallet_data.address
-            )
-            
-            if existing_wallet and existing_wallet["telegram_id"] != telegram_id:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="This wallet is already connected to another account"
-                )
-            
-            # Добавляем или обновляем информацию о кошельке
-            await conn.execute("""
-                INSERT INTO wallets (telegram_id, address, wallet_name, wallet_version, connected_at)
-                VALUES ($1, $2, $3, $4, NOW())
-                ON CONFLICT (telegram_id) 
-                DO UPDATE SET 
-                    address = EXCLUDED.address,
-                    wallet_name = EXCLUDED.wallet_name,
-                    wallet_version = EXCLUDED.wallet_version,
-                    connected_at = EXCLUDED.connected_at
-            """, telegram_id, wallet_data.address, wallet_data.wallet_name, wallet_data.wallet_version)
-        
-        return {
-            "success": True,
-            "message": "Wallet connected successfully",
-            "address": wallet_data.address,
-            "wallet_name": wallet_data.wallet_name
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to connect wallet: {str(e)}")
-
-@app.get("/wallet/info")
-async def get_wallet_info(telegram_id: int = Depends(get_current_user)):
-    """Получение информации о подключенном кошельке"""
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            wallet = await conn.fetchrow(
-                "SELECT address, wallet_name, wallet_version, connected_at FROM wallets WHERE telegram_id = $1",
-                telegram_id
-            )
-            
-            if not wallet:
-                return {"connected": False}
-            
-            return {
-                "connected": True,
-                "address": wallet["address"],
-                "wallet_name": wallet["wallet_name"],
-                "wallet_version": wallet["wallet_version"],
-                "connected_at": wallet["connected_at"].isoformat() if wallet["connected_at"] else None
-            }
-            
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get wallet info: {str(e)}")
-
-@app.get("/wallet/balance/{address}")
-async def get_wallet_balance(
-    address: str,
-    telegram_id: int = Depends(get_current_user)
-):
-    """Получение баланса TON кошелька"""
-    try:
-        # Проверяем, что кошелек принадлежит пользователю
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            wallet = await conn.fetchrow(
-                "SELECT address FROM wallets WHERE telegram_id = $1 AND address = $2",
-                telegram_id, address
-            )
-            
-            if not wallet:
-                raise HTTPException(
-                    status_code=404, 
-                    detail="Wallet not found or doesn't belong to user"
-                )
-        
-        # Получаем баланс через TON API
-        balance = await get_ton_balance(address)
-        
-        if balance is None:
-            # Если не удалось получить баланс, возвращаем 0
-            balance = 0.0
-        
-        return {
-            "address": address,
-            "balance": balance,
-            "currency": "TON"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get wallet balance: {str(e)}")
-
-@app.delete("/wallet/disconnect")
-async def disconnect_wallet(telegram_id: int = Depends(get_current_user)):
-    """Отключение кошелька от аккаунта"""
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            deleted_count = await conn.fetchval(
-                "DELETE FROM wallets WHERE telegram_id = $1 RETURNING 1",
-                telegram_id
-            )
-            
-            if not deleted_count:
-                raise HTTPException(status_code=404, detail="No wallet connected")
-            
-            return {"success": True, "message": "Wallet disconnected successfully"}
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to disconnect wallet: {str(e)}")
-
-# Существующие эндпойнты...
 
 @app.get("/balance")
 async def get_balance(telegram_id: int = Depends(get_current_user)):
