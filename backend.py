@@ -436,13 +436,13 @@ async def get_referral_stats(telegram_id: int = Depends(get_current_user)):
                 return {
                     "total_referrals": 0,
                     "total_earnings": 0,
-                    "referral_link": f"https://t.me/cyberminesq_bot?start=ref_{telegram_id}"
+                    "referral_link": f"https://t.me/cyberminesq_bot/app?startapp=ref_{telegram_id}"
                 }
             
             return {
                 "total_referrals": stats["total_referrals"] or 0,
                 "total_earnings": stats["total_referral_earnings"] or 0,
-                "referral_link": f"https://t.me/cyberminesq_bot?start=ref_{telegram_id}"
+                "referral_link": f"https://t.me/cyberminesq_bot/app?startapp=ref_{telegram_id}"
             }
             
     except Exception as e:
