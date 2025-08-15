@@ -45,7 +45,70 @@ class WalletConnectRequest(BaseModel):
 
 
 
+@app.get("/debug/referral/{user_id}")
+async def debug_referral_info(user_id: int, telegram_id: int = Depends(get_current_user)):
+    """Дебаг информации о рефералке пользователя"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Основная инфа о пользователе
+            user_info = await conn.fetchrow("""
+                SELECT telegram_id, nickname, balance, total_referrals, total_referral_earnings
+                FROM players 
+                WHERE telegram_id = $1
+            """, user_id)
+            
+            # Проверяем, кто его пригласил
+            referrer_info = await conn.fetchrow("""
+                SELECT r.referrer_id, p.nickname as referrer_name, r.created_at
+                FROM referrals r
+                JOIN players p ON p.telegram_id = r.referrer_id
+                WHERE r.referred_id = $1
+            """, user_id)
+            
+            # Кого он пригласил
+            referrals = await conn.fetch("""
+                SELECT r.referred_id, p.nickname, r.created_at
+                FROM referrals r
+                JOIN players p ON p.telegram_id = r.referred_id
+                WHERE r.referrer_id = $1
+                ORDER BY r.created_at DESC
+            """, user_id)
+            
+            # История заработков
+            earnings = await conn.fetch("""
+                SELECT amount, reason, created_at, referred_id
+                FROM referral_earnings
+                WHERE referrer_id = $1
+                ORDER BY created_at DESC
+            """, user_id)
+            
+            return {
+                "user_info": dict(user_info) if user_info else None,
+                "referred_by": dict(referrer_info) if referrer_info else None,
+                "invited_users": [dict(ref) for ref in referrals],
+                "earnings_history": [dict(earning) for earning in earnings]
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Debug error: {str(e)}")
 
+# Тестовый endpoint для создания реферальной связи вручную
+@app.post("/debug/create-referral")
+async def debug_create_referral(
+    referrer_id: int, 
+    referred_id: int,
+    telegram_id: int = Depends(get_current_user)
+):
+    """Создать реферальную связь вручную для тестирования"""
+    try:
+        success = await process_referral(referred_id, referrer_id)
+        return {
+            "success": success,
+            "message": f"Referral {'created' if success else 'failed'}: {referrer_id} -> {referred_id}"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 async def check_payment(user_wallet: str, my_wallet: str, amount_ton: float):
     """Проверка, что была транзакция на мой кошелек"""
     try:
@@ -265,15 +328,36 @@ async def auth(data: AuthRequest):
         lang = user_data.get('language_code')
         
         # ОБРАБОТКА РЕФЕРАЛЬНОГО ПАРАМЕТРА
-        start_param = params.get("start_param")
+        # Telegram может передавать параметр по-разному
         referrer_id = None
         
+        # Способ 1: start_param (основной для WebApp)
+        start_param = params.get("start_param")
         if start_param and start_param.startswith("ref_"):
             try:
                 referrer_id = int(start_param[4:])  # Убираем "ref_"
-                print(f"Referral detected: {referrer_id} -> {user_id}")
+                print(f"Referral found in start_param: {referrer_id} -> {user_id}")
             except (ValueError, TypeError):
-                print(f"Invalid referral format: {start_param}")
+                print(f"Invalid referral format in start_param: {start_param}")
+        
+        # Способ 2: Проверяем в query_id или других параметрах
+        if not referrer_id:
+            # Иногда параметры могут быть в других местах
+            for key, value in params.items():
+                if key.startswith("start") or "ref" in key.lower():
+                    print(f"Found potential referral param: {key}={value}")
+                    if isinstance(value, str) and "ref_" in value:
+                        try:
+                            ref_part = value.split("ref_")[1].split("&")[0]  # Берем часть после ref_
+                            referrer_id = int(ref_part)
+                            print(f"Referral extracted from {key}: {referrer_id} -> {user_id}")
+                            break
+                        except (ValueError, TypeError, IndexError):
+                            continue
+        
+        # Логируем все параметры для отладки
+        print(f"DEBUG - All init_data params: {params}")
+        print(f"DEBUG - Detected referrer_id: {referrer_id}")
         
         # Добавляем пользователя в БД
         try:
@@ -285,23 +369,37 @@ async def auth(data: AuthRequest):
                 )
                 
                 is_new_user = not existing_user
+                print(f"DEBUG - User {user_id} is_new_user: {is_new_user}")
                 
+                # Создаем или обновляем пользователя
                 await conn.execute("""
-                    INSERT INTO players (telegram_id, nickname, attempts, lang) 
-                    VALUES ($1, $2, 3, $3) 
-                    ON CONFLICT (telegram_id) DO UPDATE SET nickname = EXCLUDED.nickname
+                    INSERT INTO players (telegram_id, nickname, attempts, lang, balance, total_referrals, total_referral_earnings) 
+                    VALUES ($1, $2, 3, $3, 0, 0, 0) 
+                    ON CONFLICT (telegram_id) DO UPDATE SET 
+                        nickname = EXCLUDED.nickname,
+                        lang = EXCLUDED.lang
                 """, user_id, nickname, lang)
 
-                await conn.execute("INSERT INTO taskscaner (telegram_id) VALUES ($1) ON CONFLICT (telegram_id) DO NOTHING", user_id)
+                await conn.execute("""
+                    INSERT INTO taskscaner (telegram_id) 
+                    VALUES ($1) 
+                    ON CONFLICT (telegram_id) DO NOTHING
+                """, user_id)
                 
                 # Обрабатываем реферал только для новых пользователей
                 if is_new_user and referrer_id:
+                    print(f"DEBUG - Processing referral: {referrer_id} -> {user_id}")
                     success = await process_referral(user_id, referrer_id)
                     if success:
-                        print(f"Referral processed successfully: {referrer_id} -> {user_id}")
+                        print(f"SUCCESS - Referral processed: {referrer_id} -> {user_id}")
+                    else:
+                        print(f"FAILED - Referral processing failed: {referrer_id} -> {user_id}")
+                elif referrer_id:
+                    print(f"DEBUG - Referral skipped (existing user): {referrer_id} -> {user_id}")
 
         except Exception as e:
-            print(f"Database insert warning: {e}")
+            print(f"Database error: {e}")
+            # Не падаем, просто логируем
         
         # Создаем JWT токен
         token = create_jwt(user_id)
@@ -321,8 +419,8 @@ async def auth(data: AuthRequest):
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Auth error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
-
 # Аутентификация
 
 @app.get("/referral/stats")
@@ -954,22 +1052,36 @@ async def process_referral(referred_user_id: int, referrer_user_id: int):
             )
             
             if existing:
+                print(f"User {referred_user_id} already has a referrer")
                 return False  # Пользователь уже был приглашен
             
-            # Нельзя пригласить самого себя
+            # Нельзя приглашать самого себя
             if referred_user_id == referrer_user_id:
+                print(f"User {referred_user_id} tried to refer themselves")
+                return False
+            
+            # Проверяем, что реферер существует
+            referrer_exists = await conn.fetchval(
+                "SELECT 1 FROM players WHERE telegram_id = $1",
+                referrer_user_id
+            )
+            
+            if not referrer_exists:
+                print(f"Referrer {referrer_user_id} does not exist")
                 return False
             
             # Создаем реферальную связь
             await conn.execute("""
-                INSERT INTO referrals (referrer_id, referred_id)
-                VALUES ($1, $2)
+                INSERT INTO referrals (referrer_id, referred_id, created_at, is_active)
+                VALUES ($1, $2, NOW(), true)
             """, referrer_user_id, referred_user_id)
             
-            # Обновляем статистику реферера
+            print(f"Created referral relationship: {referrer_user_id} -> {referred_user_id}")
+            
+            # Обновляем статистику рефререра
             await conn.execute("""
                 UPDATE players 
-                SET total_referrals = total_referrals + 1
+                SET total_referrals = COALESCE(total_referrals, 0) + 1
                 WHERE telegram_id = $1
             """, referrer_user_id)
             
@@ -977,20 +1089,56 @@ async def process_referral(referred_user_id: int, referrer_user_id: int):
             bonus_amount = 50  # Бонус за приглашение
             await conn.execute("""
                 UPDATE players 
-                SET balance = balance + $1
+                SET balance = COALESCE(balance, 0) + $1,
+                    total_referral_earnings = COALESCE(total_referral_earnings, 0) + $1
                 WHERE telegram_id = $2
             """, bonus_amount, referrer_user_id)
             
             # Записываем заработок
             await conn.execute("""
-                INSERT INTO referral_earnings (referrer_id, referred_id, amount, reason)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO referral_earnings (referrer_id, referred_id, amount, reason, created_at)
+                VALUES ($1, $2, $3, $4, NOW())
             """, referrer_user_id, referred_user_id, bonus_amount, "new_referral")
+            
+            # Получаем имена для уведомления
+            referrer_name = await conn.fetchval(
+                "SELECT nickname FROM players WHERE telegram_id = $1",
+                referrer_user_id
+            )
+            referred_name = await conn.fetchval(
+                "SELECT nickname FROM players WHERE telegram_id = $1", 
+                referred_user_id
+            )
+            
+            # Получаем обновленную статистику
+            stats = await conn.fetchrow("""
+                SELECT total_referrals, total_referral_earnings 
+                FROM players 
+                WHERE telegram_id = $1
+            """, referrer_user_id)
+            
+            print(f"Referral bonus given: {bonus_amount} coins to {referrer_user_id}")
+            
+            # Отправляем уведомление реферреру (асинхронно, чтобы не блокировать)
+            notification_text = f"""
+🎉 <b>Новый реферал!</b>
+
+Пользователь <b>{referred_name or 'Anonymous'}</b> присоединился по вашей ссылке!
+
+💰 Вы получили <b>50 монет</b> за приглашение
+📈 Теперь вы будете получать 15% от всех его наград
+
+Всего рефералов: {stats['total_referrals'] or 1}
+Всего заработано: {stats['total_referral_earnings'] or bonus_amount}
+            """
+            
+            # Отправляем уведомление в фоне
+            asyncio.create_task(send_telegram_notification(referrer_user_id, notification_text))
             
             return True
             
     except Exception as e:
-        print(f"Error processing referral: {e}")
+        print(f"Error processing referral {referrer_user_id} -> {referred_user_id}: {e}")
         return False
 
 async def give_referral_reward(user_id: int, amount: int, reason: str):
