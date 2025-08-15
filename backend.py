@@ -252,7 +252,6 @@ async def auth(data: AuthRequest):
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid user JSON format")
         
-        # Получаем ID пользователя
         user_id = user_data.get("id")
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID not found in user data")
@@ -264,22 +263,45 @@ async def auth(data: AuthRequest):
         
         nickname = user_data.get('first_name', 'Anonymous')
         lang = user_data.get('language_code')
+        
+        # ОБРАБОТКА РЕФЕРАЛЬНОГО ПАРАМЕТРА
+        start_param = params.get("start_param")
+        referrer_id = None
+        
+        if start_param and start_param.startswith("ref_"):
+            try:
+                referrer_id = int(start_param[4:])  # Убираем "ref_"
+                print(f"Referral detected: {referrer_id} -> {user_id}")
+            except (ValueError, TypeError):
+                print(f"Invalid referral format: {start_param}")
+        
         # Добавляем пользователя в БД
         try:
             pool = await get_pool()
             async with pool.acquire() as conn:
+                # Проверяем, новый ли это пользователь
+                existing_user = await conn.fetchval(
+                    "SELECT telegram_id FROM players WHERE telegram_id = $1", user_id
+                )
+                
+                is_new_user = not existing_user
+                
                 await conn.execute("""
                     INSERT INTO players (telegram_id, nickname, attempts, lang) 
                     VALUES ($1, $2, 3, $3) 
                     ON CONFLICT (telegram_id) DO UPDATE SET nickname = EXCLUDED.nickname
                 """, user_id, nickname, lang)
 
-
                 await conn.execute("INSERT INTO taskscaner (telegram_id) VALUES ($1) ON CONFLICT (telegram_id) DO NOTHING", user_id)
+                
+                # Обрабатываем реферал только для новых пользователей
+                if is_new_user and referrer_id:
+                    success = await process_referral(user_id, referrer_id)
+                    if success:
+                        print(f"Referral processed successfully: {referrer_id} -> {user_id}")
 
         except Exception as e:
             print(f"Database insert warning: {e}")
-            # Продолжаем работу даже при ошибке БД
         
         # Создаем JWT токен
         token = create_jwt(user_id)
@@ -303,7 +325,102 @@ async def auth(data: AuthRequest):
 
 # Аутентификация
 
+@app.get("/referral/stats")
+async def get_referral_stats(telegram_id: int = Depends(get_current_user)):
+    """Получить статистику рефералов пользователя"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Основная статистика
+            stats = await conn.fetchrow("""
+                SELECT total_referrals, total_referral_earnings 
+                FROM players 
+                WHERE telegram_id = $1
+            """, telegram_id)
+            
+            if not stats:
+                return {
+                    "total_referrals": 0,
+                    "total_earnings": 0,
+                    "referral_link": f"https://t.me/cyberminesq_bot?start=ref_{telegram_id}"
+                }
+            
+            return {
+                "total_referrals": stats["total_referrals"] or 0,
+                "total_earnings": stats["total_referral_earnings"] or 0,
+                "referral_link": f"https://t.me/cyberminesq_bot?start=ref_{telegram_id}"
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+@app.get("/referral/list")
+async def get_referral_list(
+    telegram_id: int = Depends(get_current_user),
+    limit: int = Query(50, le=100)
+):
+    """Получить список рефералов пользователя"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            referrals = await conn.fetch("""
+                SELECT 
+                    p.nickname,
+                    p.balance,
+                    r.created_at
+                FROM referrals r
+                JOIN players p ON p.telegram_id = r.referred_id
+                WHERE r.referrer_id = $1 
+                ORDER BY r.created_at DESC
+                LIMIT $2
+            """, telegram_id, limit)
+            
+            return [
+                {
+                    "nickname": ref["nickname"],
+                    "balance": ref["balance"] or 0,
+                    "joined_at": ref["created_at"].isoformat() if ref["created_at"] else None
+                }
+                for ref in referrals
+            ]
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/referral/earnings")
+async def get_referral_earnings(
+    telegram_id: int = Depends(get_current_user),
+    limit: int = Query(50, le=100)
+):
+    """Получить историю заработка с рефералов"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            earnings = await conn.fetch("""
+                SELECT 
+                    re.amount,
+                    re.reason,
+                    re.created_at,
+                    p.nickname as referral_nickname
+                FROM referral_earnings re
+                JOIN players p ON p.telegram_id = re.referred_id
+                WHERE re.referrer_id = $1 
+                ORDER BY re.created_at DESC
+                LIMIT $2
+            """, telegram_id, limit)
+            
+            return [
+                {
+                    "amount": earning["amount"],
+                    "reason": earning["reason"],
+                    "referral_nickname": earning["referral_nickname"],
+                    "created_at": earning["created_at"].isoformat() if earning["created_at"] else None
+                }
+                for earning in earnings
+            ]
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 # TON Wallet эндпойнты
 
 @app.post("/wallet/connect")
@@ -506,7 +623,7 @@ async def get_balance(telegram_id: int = Depends(get_current_user)):
 
 @app.post("/balance/update")
 async def update_balance(telegram_id: int = Depends(get_current_user)):
-    reward_amount = 100  # сумма для добавления
+    reward_amount = 100
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -514,6 +631,10 @@ async def update_balance(telegram_id: int = Depends(get_current_user)):
                 "UPDATE players SET balance = balance + $1 WHERE telegram_id = $2 RETURNING balance",
                 reward_amount, telegram_id
             )
+            
+            # Даем реферальную награду
+            await give_referral_reward(telegram_id, reward_amount, "balance_update")
+            
             return {"balance": new_balance}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
@@ -818,6 +939,94 @@ async def add_st_game(telegram_id: int = Depends(get_current_user)):
         return
 
 
+class ReferralStatsRequest(BaseModel):
+    pass
+
+async def process_referral(referred_user_id: int, referrer_user_id: int):
+    """Обрабатывает реферальную связь между пользователями"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Проверяем, не был ли пользователь уже приглашен
+            existing = await conn.fetchval(
+                "SELECT 1 FROM referrals WHERE referred_id = $1",
+                referred_user_id
+            )
+            
+            if existing:
+                return False  # Пользователь уже был приглашен
+            
+            # Нельзя пригласить самого себя
+            if referred_user_id == referrer_user_id:
+                return False
+            
+            # Создаем реферальную связь
+            await conn.execute("""
+                INSERT INTO referrals (referrer_id, referred_id)
+                VALUES ($1, $2)
+            """, referrer_user_id, referred_user_id)
+            
+            # Обновляем статистику реферера
+            await conn.execute("""
+                UPDATE players 
+                SET total_referrals = total_referrals + 1
+                WHERE telegram_id = $1
+            """, referrer_user_id)
+            
+            # Даем бонус за приглашение нового пользователя
+            bonus_amount = 50  # Бонус за приглашение
+            await conn.execute("""
+                UPDATE players 
+                SET balance = balance + $1
+                WHERE telegram_id = $2
+            """, bonus_amount, referrer_user_id)
+            
+            # Записываем заработок
+            await conn.execute("""
+                INSERT INTO referral_earnings (referrer_id, referred_id, amount, reason)
+                VALUES ($1, $2, $3, $4)
+            """, referrer_user_id, referred_user_id, bonus_amount, "new_referral")
+            
+            return True
+            
+    except Exception as e:
+        print(f"Error processing referral: {e}")
+        return False
+
+async def give_referral_reward(user_id: int, amount: int, reason: str):
+    """Дает реферальную награду за действия реферала"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Находим реферера этого пользователя
+            referrer = await conn.fetchval("""
+                SELECT referrer_id FROM referrals 
+                WHERE referred_id = $1 AND is_active = true
+            """, user_id)
+            
+            if not referrer:
+                return  # Нет реферера
+            
+            # Вычисляем процент от награды (например, 15%)
+            referral_reward = int(amount * 0.15)
+            
+            if referral_reward > 0:
+                # Добавляем награду рефереру
+                await conn.execute("""
+                    UPDATE players 
+                    SET balance = balance + $1, total_referral_earnings = total_referral_earnings + $1
+                    WHERE telegram_id = $2
+                """, referral_reward, referrer)
+                
+                # Записываем заработок
+                await conn.execute("""
+                    INSERT INTO referral_earnings (referrer_id, referred_id, amount, reason)
+                    VALUES ($1, $2, $3, $4)
+                """, referrer, user_id, referral_reward, reason)
+                
+    except Exception as e:
+        print(f"Error giving referral reward: {e}")
+
 @app.get("/tasks")
 async def get_user_tasks(telegram_id: int = Depends(get_current_user)):
     pool = await get_pool()
@@ -914,9 +1123,67 @@ async def collect_task(req: CollectTaskRequest, telegram_id: int = Depends(get_c
             task["reward"], telegram_id
         )
 
+
+        await give_referral_reward(telegram_id, task["reward"], f"task_{req.st}")
         return {"message": "Task collected successfully"}
 
+async def send_telegram_notification(telegram_id: int, message: str):
+    """Отправить уведомление пользователю в Telegram"""
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {
+            "chat_id": telegram_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=data) as response:
+                if response.status == 200:
+                    print(f"Notification sent to {telegram_id}")
+                else:
+                    print(f"Failed to send notification to {telegram_id}: {response.status}")
+    except Exception as e:
+        print(f"Error sending notification: {e}")
 
+# Обновите функцию process_referral
+async def process_referral(referred_user_id: int, referrer_user_id: int):
+    """Обрабатывает реферальную связь между пользователями"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # ... существующий код ...
+            
+            if success:
+                # Получаем имена пользователей для уведомления
+                referrer_name = await conn.fetchval(
+                    "SELECT nickname FROM players WHERE telegram_id = $1",
+                    referrer_user_id
+                )
+                referred_name = await conn.fetchval(
+                    "SELECT nickname FROM players WHERE telegram_id = $1", 
+                    referred_user_id
+                )
+                
+                # Отправляем уведомление рефереру
+                notification_text = f"""
+🎉 <b>Новый реферал!</b>
+
+Пользователь <b>{referred_name}</b> присоединился по вашей ссылке!
+
+💰 Вы получили <b>50 монет</b> за приглашение
+📈 Теперь вы будете получать 15% от всех его наград
+
+Всего рефералов: {stats.total_referrals + 1}
+                """
+                
+                await send_telegram_notification(referrer_user_id, notification_text)
+            
+            return success
+            
+    except Exception as e:
+        print(f"Error processing referral: {e}")
+        return False
 
 
 

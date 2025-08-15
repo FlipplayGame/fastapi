@@ -7,7 +7,7 @@ import aiohttp
 from typing import Optional
 from urllib.parse import unquote
 import jwt  # PyJWT
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -42,6 +42,38 @@ class WalletConnectRequest(BaseModel):
     address: str
     wallet_name: str
     wallet_version: str
+
+
+
+
+async def check_payment(user_wallet: str, my_wallet: str, amount_ton: float):
+    """Проверка, что была транзакция на мой кошелек"""
+    try:
+        params = {
+            "address": my_wallet,
+            "limit": 20,
+            "api_key": TON_API_KEY
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{TON_API_URL}/getTransactions", params=params) as resp:
+                data = await resp.json()
+
+        if not data.get("ok"):
+            return False
+
+        for tx in data["result"]:
+            in_msg = tx.get("in_msg", {})
+            sender = in_msg.get("source")
+            value = int(in_msg.get("value", 0)) / 1_000_000_000
+            if sender == user_wallet and value >= amount_ton:
+                return True
+        return False
+    except Exception as e:
+        print(f"Ошибка проверки платежа: {e}")
+        return False
+
+
+
 
 def check_telegram_auth(data: str, bot_token: str) -> dict:
     """
@@ -201,7 +233,7 @@ async def get_ton_balance(address: str) -> Optional[float]:
         print(f"Error fetching TON balance: {e}")
         return None
 
-# Существующие эндпойнты...
+# Аутентификация
 
 @app.post("/auth")
 async def auth(data: AuthRequest):
@@ -231,16 +263,20 @@ async def auth(data: AuthRequest):
             raise HTTPException(status_code=400, detail=f"Invalid user ID format: {user_id}")
         
         nickname = user_data.get('first_name', 'Anonymous')
-        
+        lang = user_data.get('language_code')
         # Добавляем пользователя в БД
         try:
             pool = await get_pool()
             async with pool.acquire() as conn:
                 await conn.execute("""
-                    INSERT INTO players (telegram_id, nickname, attempts) 
-                    VALUES ($1, $2, 3) 
+                    INSERT INTO players (telegram_id, nickname, attempts, lang) 
+                    VALUES ($1, $2, 3, $3) 
                     ON CONFLICT (telegram_id) DO UPDATE SET nickname = EXCLUDED.nickname
-                """, user_id, nickname)
+                """, user_id, nickname, lang)
+
+
+                await conn.execute("INSERT INTO taskscaner (telegram_id) VALUES ($1) ON CONFLICT (telegram_id) DO NOTHING", user_id)
+
         except Exception as e:
             print(f"Database insert warning: {e}")
             # Продолжаем работу даже при ошибке БД
@@ -264,6 +300,9 @@ async def auth(data: AuthRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
+
+# Аутентификация
+
 
 # TON Wallet эндпойнты
 
@@ -315,6 +354,39 @@ async def connect_wallet(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to connect wallet: {str(e)}")
+
+
+@app.post("/wallet/check-payment")
+async def check_payment_route(
+    telegram_id: int = Depends(get_current_user)
+):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        wallet = await conn.fetchrow(
+            "SELECT address FROM wallets WHERE telegram_id = $1",
+            telegram_id
+        )
+        if not wallet:
+            return {"success": False, "message": "❌ Кошелёк не подключен. Подключите его, чтобы оплатить."}
+
+        user_wallet = wallet["address"]
+
+    # твой кошелек для приёма средств
+    my_wallet = "UQAojWl3iqFyhc4wxv2IH9E5yeo8IH6LBVXjbdsVVi_KUgPU"
+    amount = 0.4
+
+    paid = await check_payment(user_wallet, my_wallet, amount)
+
+    if paid:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE players SET balance = balance + 100 WHERE telegram_id = $1",
+                telegram_id
+            )
+        return {"success": True, "message": "✅ Оплата подтверждена, награда выдана!"}
+    else:
+        return {"success": False, "message": "⚠️ Оплата не найдена. Попробуйте через минуту."}
+
 
 @app.get("/wallet/info")
 async def get_wallet_info(telegram_id: int = Depends(get_current_user)):
@@ -401,7 +473,19 @@ async def disconnect_wallet(telegram_id: int = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to disconnect wallet: {str(e)}")
 
-# Существующие эндпойнты...
+
+
+# TON Wallet эндпойнты
+
+
+
+
+
+## Работа с балансом ##
+
+
+
+
 
 @app.get("/balance")
 async def get_balance(telegram_id: int = Depends(get_current_user)):
@@ -419,18 +503,6 @@ async def get_balance(telegram_id: int = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@app.get("/leaderboard")
-async def get_leaderboard():
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT nickname, balance FROM players ORDER BY balance DESC LIMIT 5"
-            )
-            leaderboard = [{"nickname": row["nickname"], "balance": row["balance"]} for row in rows]
-            return leaderboard
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.post("/balance/update")
 async def update_balance(telegram_id: int = Depends(get_current_user)):
@@ -445,6 +517,203 @@ async def update_balance(telegram_id: int = Depends(get_current_user)):
             return {"balance": new_balance}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+
+## Работа с балансом ##
+
+
+# Shop job ##
+
+@app.get("/catalog")
+async def get_catalog(telegram_id: int = Depends(get_current_user)):
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+
+
+            # Получаем lang пользователя
+            lang = await conn.fetchval(
+                "SELECT lang FROM players WHERE telegram_id = $1",
+                telegram_id
+            )
+            if not lang:
+                lang = "en"  # значение по умолчанию
+
+            # Загружаем товары по tag
+            rows = await conn.fetch(
+                "SELECT id, nickname FROM ru_category WHERE lang = $1",
+                lang)
+            
+            if not rows:
+                return None
+            catalog = [{"nickname": row["nickname"], "id": row["id"]} for row in rows]
+
+            return catalog
+
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/catalog/shop")
+async def get_catalog_shopcategory(
+    telegram_id: int = Depends(get_current_user),
+    shop_id: int = Query(...)
+):
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            tag = await conn.fetchval(
+                "SELECT tag_shop FROM ru_shops WHERE id = $1",
+                shop_id
+            )
+
+            if not tag:
+                raise HTTPException(status_code=404, detail="Category not found")
+
+            # Получаем lang пользователя
+            lang = await conn.fetchval(
+                "SELECT lang FROM players WHERE telegram_id = $1",
+                telegram_id
+            )
+            if not lang:
+                lang = "en"  # значение по умолчанию
+
+            # Загружаем товары по tag
+            rows = await conn.fetch(
+                "SELECT id, name FROM shop_category WHERE tag = $1 and lang = $2",
+                tag, lang
+            )
+            
+            if not rows:
+                return None
+            catalog = [{"nickname": row["name"], "id": row["id"]} for row in rows]
+
+            return catalog
+
+    except Exception as e:
+        print(f"[ERROR] get_category: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+
+@app.get("/market/lots")
+async def get_catalog_shopcategory(
+    telegram_id: int = Depends(get_current_user),
+    shop_id: int = Query(...),
+    limit: int = Query(20, gt=0),
+    offset: int = Query(0, ge=0)
+):
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            tag = await conn.fetchval(
+                "SELECT tag_lot FROM shop_category WHERE id = $1",
+                shop_id
+            )
+
+            if not tag:
+                raise HTTPException(status_code=404, detail="Category not found")
+            lang = await conn.fetchval(
+                "SELECT lang FROM players WHERE telegram_id = $1",
+                telegram_id
+            )
+            if not lang:
+                lang = "en"  # значение по умолчанию
+
+            rows = await conn.fetch(
+                """
+                SELECT id, name, image, desction, price, url 
+                FROM product_lot
+                WHERE tag = $1 and language = $2
+                ORDER BY id
+                LIMIT $3 OFFSET $4
+                """,
+                tag,lang, limit, offset
+            )
+
+            catalog = [{"nickname": row["name"], "lotId": row["id"], "image": row["image"], "desction":row["desction"], "price":row["price"], "url":row["url"]} for row in rows]
+
+            return catalog
+
+    except Exception as e:
+        print(f"[ERROR] get_category: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+
+
+@app.get("/catalog/category")
+async def get_category(
+    telegram_id: int = Depends(get_current_user),
+    category_id: int = Query(...)
+):
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Получаем tag по category_id
+            tag = await conn.fetchval(
+                "SELECT tag FROM ru_category WHERE id = $1",
+                category_id
+            )
+
+            if not tag:
+                raise HTTPException(status_code=404, detail="Category not found")
+
+            # Получаем lang пользователя
+            lang = await conn.fetchval(
+                "SELECT lang FROM players WHERE telegram_id = $1",
+                telegram_id
+            )
+            if not lang:
+                lang = "en"  # значение по умолчанию
+
+            # Загружаем товары по tag
+            rows = await conn.fetch(
+                "SELECT id, name FROM ru_shops WHERE tag = $1 and lang = $2",
+                tag, lang
+            )
+
+            catalog = [{"nickname": row["name"], "id": row["id"]} for row in rows]
+
+            return catalog
+
+    except Exception as e:
+        print(f"[ERROR] get_category: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+# Shop job ##
+
+
+
+
+## LeaderBoard ##
+
+
+@app.get("/leaderboard")
+async def get_leaderboard():
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT nickname, balance FROM players ORDER BY balance DESC LIMIT 5"
+            )
+            leaderboard = [{"nickname": row["nickname"], "balance": row["balance"]} for row in rows]
+            return leaderboard
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+
+## LeaderBoard ##
+
+
+
+## ПОПТЫКИ ##
+
+
 
 @app.get("/attempts")
 async def get_attempts(telegram_id: int = Depends(get_current_user)):
@@ -486,6 +755,7 @@ async def get_attempts(telegram_id: int = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+
 @app.post("/attempts/use")
 async def use_attempt(telegram_id: int = Depends(get_current_user)):
     """Использовать одну попытку"""
@@ -513,6 +783,7 @@ async def use_attempt(telegram_id: int = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+
 @app.post("/attempts/add")
 async def add_attempts(telegram_id: int = Depends(get_current_user)):
     """Добавить попытки"""
@@ -533,6 +804,122 @@ async def add_attempts(telegram_id: int = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+
+## ПОПТЫКИ ##
+
+
+@app.post("/stGame")
+async def add_st_game(telegram_id: int = Depends(get_current_user)):
+    promtion = 1
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        st = await conn.execute(
+            "UPDATE taskscaner SET st_startgame = st_startgame + $1 WHERE telegram_id = $2",promtion,telegram_id )
+        return
+
+
+@app.get("/tasks")
+async def get_user_tasks(telegram_id: int = Depends(get_current_user)):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # 1. Все задания
+        tasks = await conn.fetch(
+            "SELECT st, reward, count, desction FROM tasklist"
+        )
+
+        # 2. Прогресс пользователя
+        user_status = await conn.fetchrow(
+            "SELECT * FROM taskscaner WHERE telegram_id=$1",
+            telegram_id
+        )
+
+        # 3. Какие задания он уже собрал
+        completed_tasks = await conn.fetch(
+            "SELECT st_tag FROM player_task_completed WHERE telegram_id=$1 AND status=1",
+            telegram_id
+        )
+        completed_tags = {row["st_tag"] for row in completed_tasks}
+
+        result = []
+        for task in tasks:
+            st_name = task["st"]  # например "st_video"
+            user_progress = user_status.get(st_name, 0)
+            
+            # Если задание уже собрано — пропускаем
+            if st_name in completed_tags:
+                continue
+
+            result.append({
+                "tag": st_name,
+                "reward": task["reward"],
+                "count": task["count"],
+                "desction": task["desction"],
+                "user_progress": user_progress
+            })
+
+        return result
+
+
+
+class CollectTaskRequest(BaseModel):
+    st: str  # например "st_video"
+
+@app.post("/tasks/collect")
+async def collect_task(req: CollectTaskRequest, telegram_id: int = Depends(get_current_user)):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Получаем задачу
+        task = await conn.fetchrow(
+            "SELECT count, reward FROM tasklist WHERE st=$1",
+            req.st
+        )
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        # Получаем прогресс пользователя
+        user_status = await conn.fetchrow(
+            "SELECT * FROM taskscaner WHERE telegram_id=$1",
+            telegram_id
+        )
+        if user_status is None:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if user_status.get(req.st, 0) < task["count"]:
+            raise HTTPException(status_code=400, detail="Not enough progress to collect")
+
+        # Проверяем, не собирал ли уже
+        already_completed = await conn.fetchval(
+            "SELECT 1 FROM player_task_completed WHERE telegram_id=$1 AND st_tag=$2 AND status=1",
+            telegram_id, req.st
+        )
+        if already_completed:
+            return {"message": "Task already collected"}
+
+        # Записываем, что пользователь выполнил задание
+        await conn.execute(
+            """
+            INSERT INTO player_task_completed (telegram_id, st_tag, status)
+            VALUES ($1, $2, 1)
+            """,
+            telegram_id, req.st
+        )
+
+        # Начисляем награду в players.balance
+        await conn.execute(
+            """
+            UPDATE players
+            SET balance = balance + $1
+            WHERE telegram_id = $2
+            """,
+            task["reward"], telegram_id
+        )
+
+        return {"message": "Task collected successfully"}
+
+
+
+
+
 @app.get("/")
 async def root():
     return {
@@ -540,6 +927,14 @@ async def root():
         "status": "running",
         "timestamp": int(time.time())
     }
+
+
+
+
+
+
+
+
 
 @app.on_event("startup")
 async def startup():
