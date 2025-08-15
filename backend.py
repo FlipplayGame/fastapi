@@ -43,7 +43,44 @@ class WalletConnectRequest(BaseModel):
     wallet_name: str
     wallet_version: str
 
+# JWT функции - ПЕРЕМЕЩЕНЫ В НАЧАЛО
+def create_jwt(telegram_id: int) -> str:
+    """Создание JWT токена"""
+    try:
+        payload = {
+            "telegram_id": telegram_id,
+            "exp": int(time.time()) + JWT_EXP_DELTA_SECONDS,
+        }
+        
+        token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        
+        # В PyJWT 2.x jwt.encode возвращает string, не bytes
+        if isinstance(token, bytes):
+            token = token.decode('utf-8')
+            
+        return token
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Token creation failed: {str(e)}")
 
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> int:
+    """Получение пользователя из JWT"""
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        telegram_id = payload.get("telegram_id")
+        
+        if telegram_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+            
+        return telegram_id
+        
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Token validation failed: {str(e)}")
 
 @app.get("/debug/referral/{user_id}")
 async def debug_referral_info(user_id: int, telegram_id: int = Depends(get_current_user)):
@@ -58,7 +95,7 @@ async def debug_referral_info(user_id: int, telegram_id: int = Depends(get_curre
                 WHERE telegram_id = $1
             """, user_id)
             
-            # Проверяем, кто его пригласил
+            # Проверем, кто его пригласил
             referrer_info = await conn.fetchrow("""
                 SELECT r.referrer_id, p.nickname as referrer_name, r.created_at
                 FROM referrals r
@@ -109,6 +146,7 @@ async def debug_create_referral(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 async def check_payment(user_wallet: str, my_wallet: str, amount_ton: float):
     """Проверка, что была транзакция на мой кошелек"""
     try:
@@ -135,9 +173,6 @@ async def check_payment(user_wallet: str, my_wallet: str, amount_ton: float):
         print(f"Ошибка проверки платежа: {e}")
         return False
 
-
-
-
 def check_telegram_auth(data: str, bot_token: str) -> dict:
     """
     Валидация данных Telegram WebApp
@@ -156,7 +191,7 @@ def check_telegram_auth(data: str, bot_token: str) -> dict:
         if not received_hash:
             raise HTTPException(status_code=400, detail="Hash not found in init_data")
         
-        # Проверяем наличие signature (Bot API формат)
+        # Проверем наличие signature (Bot API формат)
         has_signature = "signature" in params
         if has_signature:
             params.pop("signature", None)  # Удаляем signature, он не участвует в валидации hash
@@ -170,7 +205,7 @@ def check_telegram_auth(data: str, bot_token: str) -> dict:
         # Вычисляем хеш
         calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
         
-        # Проверяем хеш
+        # Проверем хеш
         if not hmac.compare_digest(calculated_hash, received_hash):
             # Если не совпадает, возможно это устаревший формат, попробуем другой способ
             print(f"Hash mismatch with WebAppData method")
@@ -193,7 +228,7 @@ def check_telegram_auth(data: str, bot_token: str) -> dict:
                 else:
                     raise HTTPException(status_code=401, detail="Invalid hash - data may be tampered")
         
-        # Проверяем время (данные должны быть не старше 24 часов)
+        # Проверем время (данные должны быть не старше 24 часов)
         auth_date = params.get("auth_date")
         if auth_date:
             try:
@@ -212,44 +247,6 @@ def check_telegram_auth(data: str, bot_token: str) -> dict:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid initData format: {str(e)}")
 
-def create_jwt(telegram_id: int) -> str:
-    """Создание JWT токена"""
-    try:
-        payload = {
-            "telegram_id": telegram_id,
-            "exp": int(time.time()) + JWT_EXP_DELTA_SECONDS,
-        }
-        
-        token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-        
-        # В PyJWT 2.x jwt.encode возвращает string, не bytes
-        if isinstance(token, bytes):
-            token = token.decode('utf-8')
-            
-        return token
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Token creation failed: {str(e)}")
-
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> int:
-    """Получение пользователя из JWT"""
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        telegram_id = payload.get("telegram_id")
-        
-        if telegram_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token payload")
-            
-        return telegram_id
-        
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Token validation failed: {str(e)}")
-
 def is_valid_ton_address(address: str) -> bool:
     """Базовая валидация TON адреса"""
     if not address:
@@ -259,15 +256,15 @@ def is_valid_ton_address(address: str) -> bool:
     # 1. Raw address (64 hex символа)
     # 2. User-friendly address (48 символов base64)
     
-    # Проверяем user-friendly формат
+    # Проверем user-friendly формат
     if len(address) == 48 and all(c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_=' for c in address):
         return True
     
-    # Проверяем raw формат (с префиксом или без)
+    # Проверем raw формат (с префиксом или без)
     if len(address) == 64 and all(c in '0123456789abcdefABCDEF' for c in address):
         return True
     
-    # Проверяем raw формат с префиксом (0:)
+    # Проверем raw формат с префиксом (0:)
     if len(address) == 66 and address.startswith('0:') and all(c in '0123456789abcdefABCDEF' for c in address[2:]):
         return True
     
@@ -297,11 +294,10 @@ async def get_ton_balance(address: str) -> Optional[float]:
         return None
 
 # Аутентификация
-
 @app.post("/auth")
 async def auth(data: AuthRequest):
     try:
-        # Проверяем данные Telegram
+        # Проверем данные Telegram
         params = check_telegram_auth(data.init_data, TELEGRAM_BOT_TOKEN)
         
         # Извлекаем данные пользователя
@@ -340,7 +336,7 @@ async def auth(data: AuthRequest):
             except (ValueError, TypeError):
                 print(f"Invalid referral format in start_param: {start_param}")
         
-        # Способ 2: Проверяем в query_id или других параметрах
+        # Способ 2: Проверем в query_id или других параметрах
         if not referrer_id:
             # Иногда параметры могут быть в других местах
             for key, value in params.items():
@@ -363,7 +359,7 @@ async def auth(data: AuthRequest):
         try:
             pool = await get_pool()
             async with pool.acquire() as conn:
-                # Проверяем, новый ли это пользователь
+                # Проверем, новый ли это пользователь
                 existing_user = await conn.fetchval(
                     "SELECT telegram_id FROM players WHERE telegram_id = $1", user_id
                 )
@@ -421,8 +417,8 @@ async def auth(data: AuthRequest):
     except Exception as e:
         print(f"Auth error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
-# Аутентификация
 
+# Рефералы
 @app.get("/referral/stats")
 async def get_referral_stats(telegram_id: int = Depends(get_current_user)):
     """Получить статистику рефералов пользователя"""
@@ -519,8 +515,8 @@ async def get_referral_earnings(
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-# TON Wallet эндпойнты
 
+# TON Wallet эндпоинты
 @app.post("/wallet/connect")
 async def connect_wallet(
     wallet_data: WalletConnectRequest,
@@ -534,7 +530,7 @@ async def connect_wallet(
         
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Проверяем, есть ли уже такой кошелек у другого пользователя
+            # Проверем, есть ли уже такой кошелек у другого пользователя
             existing_wallet = await conn.fetchrow(
                 "SELECT telegram_id FROM wallets WHERE address = $1", 
                 wallet_data.address
@@ -570,7 +566,6 @@ async def connect_wallet(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to connect wallet: {str(e)}")
 
-
 @app.post("/wallet/check-payment")
 async def check_payment_route(
     telegram_id: int = Depends(get_current_user)
@@ -582,7 +577,7 @@ async def check_payment_route(
             telegram_id
         )
         if not wallet:
-            return {"success": False, "message": "❌ Кошелёк не подключен. Подключите его, чтобы оплатить."}
+            return {"success": False, "message": "⌘ Кошелёк не подключен. Подключите его, чтобы оплатить."}
 
         user_wallet = wallet["address"]
 
@@ -601,7 +596,6 @@ async def check_payment_route(
         return {"success": True, "message": "✅ Оплата подтверждена, награда выдана!"}
     else:
         return {"success": False, "message": "⚠️ Оплата не найдена. Попробуйте через минуту."}
-
 
 @app.get("/wallet/info")
 async def get_wallet_info(telegram_id: int = Depends(get_current_user)):
@@ -635,7 +629,7 @@ async def get_wallet_balance(
 ):
     """Получение баланса TON кошелька"""
     try:
-        # Проверяем, что кошелек принадлежит пользователю
+        # Проверем, что кошелек принадлежит пользователю
         pool = await get_pool()
         async with pool.acquire() as conn:
             wallet = await conn.fetchrow(
@@ -688,20 +682,7 @@ async def disconnect_wallet(telegram_id: int = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to disconnect wallet: {str(e)}")
 
-
-
-# TON Wallet эндпойнты
-
-
-
-
-
 ## Работа с балансом ##
-
-
-
-
-
 @app.get("/balance")
 async def get_balance(telegram_id: int = Depends(get_current_user)):
     try:
@@ -717,7 +698,6 @@ async def get_balance(telegram_id: int = Depends(get_current_user)):
             return {"balance": balance, "nickname": nickname}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
 
 @app.post("/balance/update")
 async def update_balance(telegram_id: int = Depends(get_current_user)):
@@ -737,20 +717,12 @@ async def update_balance(telegram_id: int = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
-
-## Работа с балансом ##
-
-
 # Shop job ##
-
 @app.get("/catalog")
 async def get_catalog(telegram_id: int = Depends(get_current_user)):
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-
-
             # Получаем lang пользователя
             lang = await conn.fetchval(
                 "SELECT lang FROM players WHERE telegram_id = $1",
@@ -770,10 +742,8 @@ async def get_catalog(telegram_id: int = Depends(get_current_user)):
 
             return catalog
 
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
 
 @app.get("/catalog/shop")
 async def get_catalog_shopcategory(
@@ -814,8 +784,6 @@ async def get_catalog_shopcategory(
     except Exception as e:
         print(f"[ERROR] get_category: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
-
-
 
 @app.get("/market/lots")
 async def get_catalog_shopcategory(
@@ -860,9 +828,6 @@ async def get_catalog_shopcategory(
         print(f"[ERROR] get_category: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-
-
-
 @app.get("/catalog/category")
 async def get_category(
     telegram_id: int = Depends(get_current_user),
@@ -902,15 +867,9 @@ async def get_category(
         print(f"[ERROR] get_category: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-
 # Shop job ##
 
-
-
-
 ## LeaderBoard ##
-
-
 @app.get("/leaderboard")
 async def get_leaderboard():
     try:
@@ -924,23 +883,16 @@ async def get_leaderboard():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
-
 ## LeaderBoard ##
 
-
-
-## ПОПТЫКИ ##
-
-
-
+## ПОПЫТКИ ##
 @app.get("/attempts")
 async def get_attempts(telegram_id: int = Depends(get_current_user)):
     """Получить количество попыток пользователя"""
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Проверяем наличие колонки attempts и добавляем при необходимости
+            # Проверем наличие колонки attempts и добавляем при необходимости
             try:
                 row = await conn.fetchrow(
                     "SELECT attempts FROM players WHERE telegram_id = $1", telegram_id
@@ -974,7 +926,6 @@ async def get_attempts(telegram_id: int = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.post("/attempts/use")
 async def use_attempt(telegram_id: int = Depends(get_current_user)):
     """Использовать одну попытку"""
@@ -1002,7 +953,6 @@ async def use_attempt(telegram_id: int = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
 @app.post("/attempts/add")
 async def add_attempts(telegram_id: int = Depends(get_current_user)):
     """Добавить попытки"""
@@ -1023,9 +973,7 @@ async def add_attempts(telegram_id: int = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-
-## ПОПТЫКИ ##
-
+## ПОПЫТКИ ##
 
 @app.post("/stGame")
 async def add_st_game(telegram_id: int = Depends(get_current_user)):
@@ -1036,7 +984,6 @@ async def add_st_game(telegram_id: int = Depends(get_current_user)):
             "UPDATE taskscaner SET st_startgame = st_startgame + $1 WHERE telegram_id = $2",promtion,telegram_id )
         return
 
-
 class ReferralStatsRequest(BaseModel):
     pass
 
@@ -1045,7 +992,7 @@ async def process_referral(referred_user_id: int, referrer_user_id: int):
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Проверяем, не был ли пользователь уже приглашен
+            # Проверем, не был ли пользователь уже приглашен
             existing = await conn.fetchval(
                 "SELECT 1 FROM referrals WHERE referred_id = $1",
                 referred_user_id
@@ -1060,7 +1007,7 @@ async def process_referral(referred_user_id: int, referrer_user_id: int):
                 print(f"User {referred_user_id} tried to refer themselves")
                 return False
             
-            # Проверяем, что реферер существует
+            # Проверем, что референт существует
             referrer_exists = await conn.fetchval(
                 "SELECT 1 FROM players WHERE telegram_id = $1",
                 referrer_user_id
@@ -1078,7 +1025,7 @@ async def process_referral(referred_user_id: int, referrer_user_id: int):
             
             print(f"Created referral relationship: {referrer_user_id} -> {referred_user_id}")
             
-            # Обновляем статистику рефререра
+            # Обновляем статистику референса
             await conn.execute("""
                 UPDATE players 
                 SET total_referrals = COALESCE(total_referrals, 0) + 1
@@ -1119,7 +1066,7 @@ async def process_referral(referred_user_id: int, referrer_user_id: int):
             
             print(f"Referral bonus given: {bonus_amount} coins to {referrer_user_id}")
             
-            # Отправляем уведомление реферреру (асинхронно, чтобы не блокировать)
+            # Отправляем уведомление референту (асинхронно, чтобы не блокировать)
             notification_text = f"""
 🎉 <b>Новый реферал!</b>
 
@@ -1146,20 +1093,20 @@ async def give_referral_reward(user_id: int, amount: int, reason: str):
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Находим реферера этого пользователя
+            # Находим референта этого пользователя
             referrer = await conn.fetchval("""
                 SELECT referrer_id FROM referrals 
                 WHERE referred_id = $1 AND is_active = true
             """, user_id)
             
             if not referrer:
-                return  # Нет реферера
+                return  # Нет референта
             
             # Вычисляем процент от награды (например, 15%)
             referral_reward = int(amount * 0.15)
             
             if referral_reward > 0:
-                # Добавляем награду рефереру
+                # Добавляем награду референту
                 await conn.execute("""
                     UPDATE players 
                     SET balance = balance + $1, total_referral_earnings = total_referral_earnings + $1
@@ -1216,8 +1163,6 @@ async def get_user_tasks(telegram_id: int = Depends(get_current_user)):
 
         return result
 
-
-
 class CollectTaskRequest(BaseModel):
     st: str  # например "st_video"
 
@@ -1244,7 +1189,7 @@ async def collect_task(req: CollectTaskRequest, telegram_id: int = Depends(get_c
         if user_status.get(req.st, 0) < task["count"]:
             raise HTTPException(status_code=400, detail="Not enough progress to collect")
 
-        # Проверяем, не собирал ли уже
+        # Проверем, не собирал ли уже
         already_completed = await conn.fetchval(
             "SELECT 1 FROM player_task_completed WHERE telegram_id=$1 AND st_tag=$2 AND status=1",
             telegram_id, req.st
@@ -1271,7 +1216,6 @@ async def collect_task(req: CollectTaskRequest, telegram_id: int = Depends(get_c
             task["reward"], telegram_id
         )
 
-
         await give_referral_reward(telegram_id, task["reward"], f"task_{req.st}")
         return {"message": "Task collected successfully"}
 
@@ -1294,47 +1238,6 @@ async def send_telegram_notification(telegram_id: int, message: str):
     except Exception as e:
         print(f"Error sending notification: {e}")
 
-# Обновите функцию process_referral
-async def process_referral(referred_user_id: int, referrer_user_id: int):
-    """Обрабатывает реферальную связь между пользователями"""
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # ... существующий код ...
-            
-            if success:
-                # Получаем имена пользователей для уведомления
-                referrer_name = await conn.fetchval(
-                    "SELECT nickname FROM players WHERE telegram_id = $1",
-                    referrer_user_id
-                )
-                referred_name = await conn.fetchval(
-                    "SELECT nickname FROM players WHERE telegram_id = $1", 
-                    referred_user_id
-                )
-                
-                # Отправляем уведомление рефереру
-                notification_text = f"""
-🎉 <b>Новый реферал!</b>
-
-Пользователь <b>{referred_name}</b> присоединился по вашей ссылке!
-
-💰 Вы получили <b>50 монет</b> за приглашение
-📈 Теперь вы будете получать 15% от всех его наград
-
-Всего рефералов: {stats.total_referrals + 1}
-                """
-                
-                await send_telegram_notification(referrer_user_id, notification_text)
-            
-            return success
-            
-    except Exception as e:
-        print(f"Error processing referral: {e}")
-        return False
-
-
-
 @app.get("/")
 async def root():
     return {
@@ -1342,14 +1245,6 @@ async def root():
         "status": "running",
         "timestamp": int(time.time())
     }
-
-
-
-
-
-
-
-
 
 @app.on_event("startup")
 async def startup():
