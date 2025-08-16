@@ -7,7 +7,7 @@ import aiohttp
 from typing import Optional
 from urllib.parse import unquote
 import jwt  # PyJWT
-from fastapi import FastAPI, HTTPException, Depends, Query, Request
+from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -972,35 +972,6 @@ async def add_attempts(telegram_id: int = Depends(get_current_user)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-
-
-
-ADSGRAM_SECRET = "ВАШ_СЕКРЕТ_ИЗ_КАБИНЕТА"
-
-@app.post("/adsgram/callback")
-async def adsgram_callback(request: Request):
-    data = await request.json()
-    block_id = data.get("block_id")
-    user_id = data.get("user_id")
-    tx_id = data.get("tx_id")
-    status = data.get("status")
-    signature = data.get("signature")
-
-    # Проверка подписи
-    raw = f"{block_id}:{user_id}:{tx_id}:{status}:{ADSGRAM_SECRET}"
-    expected_sig = hashlib.sha256(raw.encode()).hexdigest()
-    if signature != expected_sig:
-        raise HTTPException(status_code=403, detail="Invalid signature")
-
-    if status == "success":
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE players SET attempts = COALESCE(attempts, 0) + 1 WHERE telegram_id = $1",
-                int(user_id)
-            )
-    return {"ok": True}
 
 ## ПОПЫТКИ ##
 
