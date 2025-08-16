@@ -960,7 +960,7 @@ async def add_attempts(telegram_id: int = Depends(get_current_user)):
         pool = await get_pool()
         async with pool.acquire() as conn:
             new_attempts = await conn.fetchval(
-                "UPDATE players SET attempts = COALESCE(attempts, 0) + 1 WHERE telegram_id = $1 RETURNING attempts",
+                "UPDATE players SET attempts = attempts + 1 WHERE telegram_id = $1 RETURNING attempts",
                 telegram_id
             )
             
@@ -976,7 +976,7 @@ async def add_attempts(telegram_id: int = Depends(get_current_user)):
 
 
 
-ADSGRAM_SECRET = "ВАШ_СЕКРЕТ_ИЗ_КАБИНЕТА"
+ADSGRAM_SECRET = "41be0cbd478c45f58793b4432d73114b"
 
 @app.post("/adsgram/callback")
 async def adsgram_callback(request: Request):
