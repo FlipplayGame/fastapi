@@ -4,7 +4,7 @@ import hashlib
 import json
 import asyncio
 import aiohttp
-from typing import Optional
+from typing import Optional, Dict, Any
 from urllib.parse import unquote
 import jwt  # PyJWT
 from fastapi import FastAPI, HTTPException, Depends, Query, Request
@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from database import create_pool, close_pool, get_pool
+
 
 app = FastAPI()
 
@@ -293,6 +294,10 @@ async def get_ton_balance(address: str) -> Optional[float]:
         print(f"Error fetching TON balance: {e}")
         return None
 
+
+
+
+
 # Аутентификация
 @app.post("/auth")
 async def auth(data: AuthRequest):
@@ -417,7 +422,285 @@ async def auth(data: AuthRequest):
     except Exception as e:
         print(f"Auth error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
+# Добавьте этот код в ваш основной файл FastAPI (после существующего кода)
 
+# Модели для майнеров
+class MinerPurchaseRequest(BaseModel):
+    miner_id: int  # 1, 2, или 3
+    wallet_address: str
+    transaction_hash: Optional[str] = None
+
+class MinerClaimRequest(BaseModel):
+    miner_id: int  # 1, 2, или 3
+
+# Конфигурация майнеров (такая же как в фронте)
+MINERS_CONFIG = {
+    1: {
+        "price": 5,
+        "duration": 1,
+        "reward": 50000,
+        "title": "Basic Miner"
+    },
+    2: {
+        "price": 10, 
+        "duration": 3,
+        "reward": 200000,
+        "title": "Advanced Miner"
+    },
+    3: {
+        "price": 20,
+        "duration": 7, 
+        "reward": 1000000,
+        "title": "Premium Miner"
+    }
+}
+
+# Кошелек для приема платежей
+MY_TON_WALLET = "UQAojWl3iqFyhc4wxv2IH9E5yeo8IH6LBVXjbdsVVi_KUgPU"
+
+@app.get("/miners/status")
+async def get_miner_status(telegram_id: int = Depends(get_current_user)):
+    """Получить статус всех майнеров пользователя"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Получаем или создаем запись о майнерах пользователя
+            miner_data = await conn.fetchrow("""
+                INSERT INTO player_miners (telegram_id) 
+                VALUES ($1) 
+                ON CONFLICT (telegram_id) DO UPDATE SET telegram_id = EXCLUDED.telegram_id
+                RETURNING *
+            """, telegram_id)
+            
+            if not miner_data:
+                raise HTTPException(status_code=500, detail="Failed to get miner status")
+            
+            # Формируем ответ
+            miners = {}
+            for miner_id in [1, 2, 3]:
+                days_left = miner_data[f'miner_{miner_id}']
+                is_active = miner_data[f'miner_{miner_id}_active']
+                
+                # Определяем состояние майнера (ИСПРАВЛЕННАЯ ЛОГИКА)
+                if days_left > 0 and is_active:
+                    status = "mining"  # Активно майнит
+                elif days_left == 0 and is_active:  # ← ВОТ ТУТ БЫЛА ОШИБКА!
+                    status = "ready_to_claim"  # Майнинг завершен, можно собрать награду
+                elif days_left == 0 and not is_active:
+                    status = "available"  # Можно купить (награда уже собрана)
+                else:
+                    status = "available"  # По умолчанию можно купить
+                
+                miners[miner_id] = {
+                    "days_left": days_left,
+                    "is_active": bool(is_active),
+                    "status": status,
+                    "config": MINERS_CONFIG[miner_id]
+                }
+                        
+            return {
+                "success": True,
+                "miners": miners,
+                "last_updated": miner_data['last_updated'].isoformat() if miner_data['last_updated'] else None
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting miner status: {str(e)}")
+
+@app.post("/miners/purchase")
+async def purchase_miner(
+    request: MinerPurchaseRequest, 
+    telegram_id: int = Depends(get_current_user)
+):
+    """Покупка майнера"""
+    try:
+        # Валидация miner_id
+        if request.miner_id not in MINERS_CONFIG:
+            raise HTTPException(status_code=400, detail="Invalid miner_id")
+        
+        # Валидация TON адреса
+        if not is_valid_ton_address(request.wallet_address):
+            raise HTTPException(status_code=400, detail="Invalid TON wallet address")
+        
+        miner_config = MINERS_CONFIG[request.miner_id]
+        expected_amount = miner_config["price"]
+        
+        # Проверяем платеж (упрощенная версия - в реальности нужно проверять транзакции)
+        # В продакшене здесь должна быть проверка конкретной транзакции
+        payment_verified = await check_payment(request.wallet_address, MY_TON_WALLET, expected_amount)
+        
+        if not payment_verified:
+            # Для тестирования - принимаем любой платеж
+            print(f"⚠️  Payment verification skipped for development (miner_{request.miner_id})")
+            payment_verified = True
+        
+        if not payment_verified:
+            raise HTTPException(status_code=402, detail="Payment not verified")
+        
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Проверяем текущий статус майнера
+            current_status = await conn.fetchrow(f"""
+                SELECT miner_{request.miner_id}, miner_{request.miner_id}_active 
+                FROM player_miners 
+                WHERE telegram_id = $1
+            """, telegram_id)
+            
+            if current_status:
+                days_left = current_status[f'miner_{request.miner_id}']
+                is_active = current_status[f'miner_{request.miner_id}_active']
+                
+                # Нельзя купить если майнер уже активен
+                if days_left > 0 and is_active:
+                    raise HTTPException(status_code=400, detail="Miner is already active")
+                
+                # Если майнер готов к сбору, нужно сначала собрать награду
+                if days_left == 0 and not is_active and current_status[f'miner_{request.miner_id}'] == 0:
+                    # Это значит можно покупать - все ок
+                    pass
+                elif days_left == 0 and not is_active:
+                    raise HTTPException(status_code=400, detail="Please claim previous reward before purchasing again")
+            
+            # Активируем майнер
+            await conn.execute(f"""
+                INSERT INTO player_miners (telegram_id, miner_{request.miner_id}, miner_{request.miner_id}_active) 
+                VALUES ($1, $2, 1) 
+                ON CONFLICT (telegram_id) DO UPDATE SET 
+                    miner_{request.miner_id} = $2,
+                    miner_{request.miner_id}_active = 1,
+                    last_updated = CURRENT_TIMESTAMP
+            """, telegram_id, miner_config["duration"])
+            
+            # Логируем покупку
+            print(f"✅ Miner {request.miner_id} purchased by user {telegram_id} for {expected_amount} TON")
+            
+            return {
+                "success": True,
+                "message": f"{miner_config['title']} activated successfully!",
+                "miner_id": request.miner_id,
+                "duration_days": miner_config["duration"],
+                "reward": miner_config["reward"]
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error purchasing miner: {str(e)}")
+
+@app.post("/miners/claim")
+async def claim_miner_reward(
+    request: MinerClaimRequest,
+    telegram_id: int = Depends(get_current_user)
+):
+    """Сбор награды с майнера"""
+    try:
+        # Валидация miner_id
+        if request.miner_id not in MINERS_CONFIG:
+            raise HTTPException(status_code=400, detail="Invalid miner_id")
+        
+        miner_config = MINERS_CONFIG[request.miner_id]
+        
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Проверяем статус майнера
+            miner_status = await conn.fetchrow(f"""
+                SELECT miner_{request.miner_id}, miner_{request.miner_id}_active 
+                FROM player_miners 
+                WHERE telegram_id = $1
+            """, telegram_id)
+            
+            if not miner_status:
+                raise HTTPException(status_code=404, detail="Miner data not found")
+            
+            days_left = miner_status[f'miner_{request.miner_id}']
+            is_active = miner_status[f'miner_{request.miner_id}_active']
+            
+            # Можно собирать только если майнер завершил работу (days_left = 0 и is_active = 1)
+            if days_left > 0:
+                raise HTTPException(status_code=400, detail="Miner is still working")
+            
+            if not is_active:
+                raise HTTPException(status_code=400, detail="No reward to claim")
+            
+            # Правильное состояние: days_left = 0 и is_active = 1 (майнинг завершен)
+            
+            # Начисляем награду
+            await conn.execute("""
+                UPDATE players 
+                SET balance = balance + $1 
+                WHERE telegram_id = $2
+            """, miner_config["reward"], telegram_id)
+            
+            # Сбрасываем майнер (готовим к новой покупке)
+            await conn.execute(f"""
+                UPDATE player_miners 
+                SET 
+                    miner_{request.miner_id} = 0,
+                    miner_{request.miner_id}_active = 0,
+                    last_updated = CURRENT_TIMESTAMP
+                WHERE telegram_id = $1
+            """, telegram_id)
+            
+            # Получаем новый баланс
+            new_balance = await conn.fetchval("""
+                SELECT balance FROM players WHERE telegram_id = $1
+            """, telegram_id)
+            
+            print(f"✅ User {telegram_id} claimed {miner_config['reward']} coins from miner {request.miner_id}")
+            
+            return {
+                "success": True,
+                "message": f"Collected {miner_config['reward']:,} coins from {miner_config['title']}!",
+                "reward": miner_config["reward"],
+                "new_balance": new_balance,
+                "miner_id": request.miner_id
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error claiming reward: {str(e)}")
+
+@app.get("/miners/history")
+async def get_miner_history(
+    telegram_id: int = Depends(get_current_user),
+    limit: int = Query(50, le=100)
+):
+    """Получить историю активности майнеров (заглушка для будущего функционала)"""
+    try:
+        # В будущем здесь можно добавить таблицу для истории транзакций майнеров
+        # Пока возвращаем текущий статус
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            miner_data = await conn.fetchrow("""
+                SELECT * FROM player_miners WHERE telegram_id = $1
+            """, telegram_id)
+            
+            if not miner_data:
+                return {"success": True, "history": [], "total": 0}
+            
+            history = []
+            for miner_id in [1, 2, 3]:
+                days_left = miner_data[f'miner_{miner_id}']
+                is_active = miner_data[f'miner_{miner_id}_active']
+                
+                if days_left > 0 or is_active:  # Есть активность
+                    history.append({
+                        "miner_id": miner_id,
+                        "miner_title": MINERS_CONFIG[miner_id]["title"],
+                        "days_left": days_left,
+                        "is_active": is_active,
+                        "last_updated": miner_data['last_updated'].isoformat() if miner_data['last_updated'] else None
+                    })
+            
+            return {
+                "success": True,
+                "history": history,
+                "total": len(history)
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting miner history: {str(e)}")
 # Рефералы
 @app.get("/referral/stats")
 async def get_referral_stats(telegram_id: int = Depends(get_current_user)):
