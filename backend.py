@@ -1068,6 +1068,181 @@ async def get_catalog_shopcategory(
         print(f"[ERROR] get_category: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
+@app.get("/market/search")
+async def search_products_by_description(
+    telegram_id: int = Depends(get_current_user),
+    shop_id: int = Query(..., description="ID категории для поиска"),
+    search_query: str = Query(..., min_length=1, description="Поисковый запрос по описанию"),
+    limit: int = Query(20, gt=0, le=100),
+    offset: int = Query(0, ge=0)
+):
+    """
+    Поиск товаров по описанию внутри определенной категории
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Получаем тег категории
+            tag = await conn.fetchval(
+                "SELECT tag_lot FROM shop_category WHERE id = $1",
+                shop_id
+            )
+            if not tag:
+                raise HTTPException(status_code=404, detail="Category not found")
+                
+            # Получаем язык пользователя
+            lang = await conn.fetchval(
+                "SELECT lang FROM players WHERE telegram_id = $1",
+                telegram_id
+            )
+            if not lang:
+                lang = "en"  # значение по умолчанию
+            
+            # Ищем товары по описанию внутри категории с определенным тегом
+            rows = await conn.fetch(
+                """
+                SELECT id, name, image, desction, price, url
+                FROM product_lot
+                WHERE tag = $1 AND language = $2 AND desction ILIKE $3
+                ORDER BY id
+                LIMIT $4 OFFSET $5
+                """,
+                tag,                    # $1 - тег категории
+                lang,                   # $2 - язык
+                f"%{search_query}%",    # $3 - поиск по описанию
+                limit,                  # $4 - лимит
+                offset                  # $5 - смещение
+            )
+            
+            # Получаем общее количество найденных товаров для пагинации
+            total_count = await conn.fetchval(
+                """
+                SELECT COUNT(*) 
+                FROM product_lot
+                WHERE tag = $1 AND language = $2 AND desction ILIKE $3
+                """,
+                tag,
+                lang,
+                f"%{search_query}%"
+            )
+            
+            catalog = [
+                {
+                    "nickname": row["name"], 
+                    "lotId": row["id"], 
+                    "image": row["image"], 
+                    "desction": row["desction"], 
+                    "price": row["price"], 
+                    "url": row["url"]
+                } 
+                for row in rows
+            ]
+            
+            return {
+                "items": catalog,
+                "total": total_count,
+                "has_more": len(catalog) == limit and (offset + limit) < total_count
+            }
+            
+    except Exception as e:
+        print(f"[ERROR] search_products_by_description: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@app.get("/market/shop/search")
+async def search_products_in_shop(
+    telegram_id: int = Depends(get_current_user),
+    shop_id: int = Query(..., description="ID магазина для поиска"),
+    search_query: str = Query(..., min_length=1, description="Поисковый запрос по описанию"),
+    limit: int = Query(20, gt=0, le=100),
+    offset: int = Query(0, ge=0)
+):
+    """
+    Поиск товаров по описанию во всех категориях магазина
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Сначала получаем tag_shop из таблицы ru_shops по shop_id
+            tag_shop = await conn.fetchval(
+                "SELECT tag_shop FROM ru_shops WHERE id = $1",
+                shop_id
+            )
+            
+            if not tag_shop:
+                raise HTTPException(status_code=404, detail="Shop not found")
+            
+            # Получаем все tag_lot категорий для данного tag_shop
+            category_tags = await conn.fetch(
+                "SELECT tag_lot FROM shop_category WHERE tag = $1",
+                tag_shop
+            )
+            
+            if not category_tags:
+                raise HTTPException(status_code=404, detail="Shop has no categories")
+            
+            # Создаем список тегов категорий
+            tags = [row["tag_lot"] for row in category_tags]
+                
+            # Получаем язык пользователя
+            lang = await conn.fetchval(
+                "SELECT lang FROM players WHERE telegram_id = $1",
+                telegram_id
+            )
+            if not lang:
+                lang = "en"  # значение по умолчанию
+            
+            # Ищем товары по описанию среди всех категорий магазина
+            rows = await conn.fetch(
+                """
+                SELECT id, name, image, desction, price, url, tag
+                FROM product_lot
+                WHERE tag = ANY($1) AND language = $2 AND desction ILIKE $3
+                ORDER BY id
+                LIMIT $4 OFFSET $5
+                """,
+                tags,                   # $1 - массив тегов категорий магазина
+                lang,                   # $2 - язык
+                f"%{search_query}%",    # $3 - поиск по описанию
+                limit,                  # $4 - лимит
+                offset                  # $5 - смещение
+            )
+            
+            # Получаем общее количество найденных товаров для пагинации
+            total_count = await conn.fetchval(
+                """
+                SELECT COUNT(*) 
+                FROM product_lot
+                WHERE tag = ANY($1) AND language = $2 AND desction ILIKE $3
+                """,
+                tags,
+                lang,
+                f"%{search_query}%"
+            )
+            
+            catalog = [
+                {
+                    "nickname": row["name"], 
+                    "lotId": row["id"], 
+                    "image": row["image"], 
+                    "desction": row["desction"], 
+                    "price": row["price"], 
+                    "url": row["url"],
+                    "tag": row["tag"]  # Возвращаем тег для показа категории
+                } 
+                for row in rows
+            ]
+            
+            return {
+                "items": catalog,
+                "total": total_count,
+                "has_more": len(catalog) == limit and (offset + limit) < total_count
+            }
+            
+    except Exception as e:
+        print(f"[ERROR] search_products_in_shop: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
 @app.get("/market/lots")
 async def get_catalog_shopcategory(
     telegram_id: int = Depends(get_current_user),
